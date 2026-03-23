@@ -1,0 +1,198 @@
+name: AIDNA Nightly Scrape
+
+on:
+  schedule:
+    # Run at midnight UTC daily (5:30 AM IST)
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Scraping mode'
+        required: true
+        default: 'incremental'
+        type: choice
+        options:
+          - incremental
+          - full
+      target:
+        description: 'Which pipeline to run'
+        required: true
+        default: 'both'
+        type: choice
+        options:
+          - cms
+          - wp
+          - both
+
+env:
+  PYTHON_VERSION: '3.11'
+
+jobs:
+  # =========================================================================
+  # JOB 1: CMS Pipeline (BusinessABC + SportsABC via Strapi GraphQL)
+  # =========================================================================
+  cms-pipeline:
+    name: CMS Pipeline (Strapi)
+    if: >-
+      github.event_name == 'schedule' ||
+      github.event.inputs.target == 'cms' ||
+      github.event.inputs.target == 'both'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install CMS dependencies
+        run: pip install -r cms_incremental_pipeline/requirements.txt
+
+      - name: Write GCP service account key
+        run: |
+          mkdir -p cms_incremental_pipeline/data
+          echo '${{ secrets.GCP_SERVICE_ACCOUNT_JSON }}' > cms_incremental_pipeline/data/service-account.json
+
+      - name: Write CMS .env
+        run: |
+          cat > cms_incremental_pipeline/.env << 'ENVEOF'
+          BUSINESSABC_STRAPI_GRAPHQL_URL=${{ secrets.BUSINESSABC_STRAPI_GRAPHQL_URL }}
+          BUSINESSABC_STRAPI_BEARER_TOKEN=${{ secrets.BUSINESSABC_STRAPI_BEARER_TOKEN }}
+          SPORTSABC_STRAPI_GRAPHQL_URL=${{ secrets.SPORTSABC_STRAPI_GRAPHQL_URL }}
+          SPORTSABC_STRAPI_BEARER_TOKEN=${{ secrets.SPORTSABC_STRAPI_BEARER_TOKEN }}
+          GCP_PROJECT_ID=${{ secrets.GCP_PROJECT_ID }}
+          BIGQUERY_DATASET=strapi_content_data
+          BIGQUERY_TABLE=unified_cms_content_combined
+          GOOGLE_CREDENTIALS_PATH=./data/service-account.json
+          SUPABASE_URL=${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY=${{ secrets.SUPABASE_KEY }}
+          PAGE_SIZE=100
+          REQUEST_DELAY=0.1
+          INSERT_BATCH_SIZE=100
+          LOG_LEVEL=INFO
+          LOG_FILE=./logs/cms_pipeline.log
+          FLASK_PORT=5001
+          ENVEOF
+
+      - name: Run CMS diagnostics
+        working-directory: cms_incremental_pipeline/backend
+        run: python pipeline.py --diagnostics
+        env:
+          PYTHONUNBUFFERED: 1
+
+      - name: Run CMS incremental pipeline
+        working-directory: cms_incremental_pipeline/backend
+        run: |
+          python pipeline.py \
+            --mode ${{ github.event.inputs.mode || 'incremental' }} \
+            --no-wikipedia
+        env:
+          PYTHONUNBUFFERED: 1
+
+      - name: Upload CMS logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cms-pipeline-logs-${{ github.run_number }}
+          path: cms_incremental_pipeline/logs/
+          retention-days: 14
+
+  # =========================================================================
+  # JOB 2: WordPress Pipeline (5 WordPress sites via sitemaps)
+  # =========================================================================
+  wp-pipeline:
+    name: WordPress Pipeline
+    if: >-
+      github.event_name == 'schedule' ||
+      github.event.inputs.target == 'wp' ||
+      github.event.inputs.target == 'both'
+    needs: [cms-pipeline]
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install WordPress dependencies
+        run: pip install -r wordpress_scraping_pipeline/backend/requirements.txt
+
+      - name: Write GCP service account key
+        run: |
+          mkdir -p wordpress_scraping_pipeline/data
+          echo '${{ secrets.GCP_SERVICE_ACCOUNT_JSON }}' > wordpress_scraping_pipeline/data/service-account.json
+
+      - name: Write WordPress .env
+        run: |
+          cat > wordpress_scraping_pipeline/.env << 'ENVEOF'
+          GCP_PROJECT_ID=${{ secrets.GCP_PROJECT_ID }}
+          BIGQUERY_DATASET=strapi_content_data
+          BIGQUERY_TABLE=unified_all_cms_content
+          GOOGLE_APPLICATION_CREDENTIALS=../data/service-account.json
+          SUPABASE_URL=${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY=${{ secrets.SUPABASE_KEY }}
+          REQUEST_DELAY=1.5
+          MAX_RETRIES=3
+          WIKIMEDIA_MAX_IMAGES=2
+          INSERT_BATCH_SIZE=20
+          CHECKPOINT_INTERVAL=50
+          LOG_LEVEL=INFO
+          LOG_FILE=../logs/wordpress_pipeline.log
+          ENVEOF
+
+      - name: Run WordPress incremental pipeline
+        working-directory: wordpress_scraping_pipeline/backend
+        run: |
+          python pipeline.py \
+            --mode ${{ github.event.inputs.mode || 'incremental' }}
+        env:
+          PYTHONUNBUFFERED: 1
+
+      - name: Upload WordPress logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wp-pipeline-logs-${{ github.run_number }}
+          path: wordpress_scraping_pipeline/logs/
+          retention-days: 14
+
+  # =========================================================================
+  # JOB 3: Notification (runs after both complete)
+  # =========================================================================
+  notify:
+    name: Pipeline Notification
+    needs: [cms-pipeline, wp-pipeline]
+    if: always()
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check results
+        run: |
+          echo "CMS Pipeline: ${{ needs.cms-pipeline.result }}"
+          echo "WP Pipeline:  ${{ needs.wp-pipeline.result }}"
+
+      - name: Report failure
+        if: >-
+          needs.cms-pipeline.result == 'failure' ||
+          needs.wp-pipeline.result == 'failure'
+        run: |
+          echo "::error::⚠️ One or more pipelines failed! Check logs above."
+          echo "CMS: ${{ needs.cms-pipeline.result }}"
+          echo "WP:  ${{ needs.wp-pipeline.result }}"
+          exit 1
+
+      - name: Report success
+        if: >-
+          needs.cms-pipeline.result == 'success' &&
+          needs.wp-pipeline.result == 'success'
+        run: |
+          echo "✅ Both pipelines completed successfully!"
