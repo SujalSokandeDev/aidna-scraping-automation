@@ -267,6 +267,25 @@ class BigQueryDeliveryTests(unittest.TestCase):
             ids.append(client.query.call_args_list[0].kwargs['job_id'])
         self.assertEqual(ids[0], ids[1])
 
+    def test_oversized_batch_is_split_and_each_chunk_verified(self):
+        first, second = self.row(), self.row()
+        first['attributes'] = second['attributes'] = {'content': 'x' * 1_600_000}
+        second['id'] = '2'
+        client = self.client()
+        client.query.side_effect = [Mock(result=Mock(return_value=[])),
+            Mock(result=Mock(return_value=[SimpleNamespace(id='1', source='3', content_type='post')])),
+            Mock(result=Mock(return_value=[])),
+            Mock(result=Mock(return_value=[SimpleNamespace(id='2', source='3', content_type='post')]))]
+        self.assertEqual(merge_records(client, 'project.dataset.table', [first, second]), 2)
+        self.assertEqual(client.query.call_count, 4)
+
+    def test_oversized_single_record_is_not_marked_delivered(self):
+        row = self.row(); row['attributes'] = {'content': 'x' * 3_100_000}
+        client = self.client()
+        with self.assertRaisesRegex(ValueError, 'single record'):
+            merge_records(client, 'project.dataset.table', [row])
+        client.query.assert_not_called()
+
     def test_uncertain_accepted_job_is_retrieved_before_readback(self):
         client = self.client(); client.query.side_effect = [Conflict('exists'), Mock(result=Mock(return_value=[SimpleNamespace(id='1', source='3', content_type='post')]))]
         self.assertEqual(merge_records(client, 'project.dataset.table', [self.row()]), 1)

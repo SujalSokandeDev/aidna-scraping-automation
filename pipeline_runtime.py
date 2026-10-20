@@ -105,8 +105,12 @@ def merge_records(client, table_id, records):
             raise ValueError("A delivery timestamp is required")
         rows.append(row)
     payload = json.dumps(rows, ensure_ascii=False)
-    if len(payload.encode("utf-8")) > 6_000_000:
-        raise ValueError("Delivery batch exceeds 6 MB; reduce INSERT_BATCH_SIZE")
+    # Leave room for JSON request escaping, query text and client metadata under API limits.
+    if len(payload.encode("utf-8")) > 3_000_000:
+        if len(rows) == 1:
+            raise ValueError("A single record exceeds the safe 3 MB delivery payload limit")
+        middle = len(rows) // 2
+        return merge_records(client, table_id, rows[:middle]) + merge_records(client, table_id, rows[middle:])
 
     table = client.get_table(table_id)
     selections = []
