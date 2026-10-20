@@ -116,6 +116,14 @@ class CMSReliabilityTests(unittest.TestCase):
         self.assertEqual(len(rows), 1); self.assertFalse(stats['complete'])
         self.assertEqual([call.args[2] for call in fetcher.fetch_page.call_args_list], [1, 2])
 
+    def test_discovery_deadline_does_not_claim_completion(self):
+        fetcher = CMS.CMSFetcher('https://example.invalid/graphql', '')
+        fetcher.deadline = 0
+        fetcher.fetch_page = Mock()
+        rows, stats = fetcher.fetch_all_pages('query', 'posts')
+        self.assertFalse(stats['complete']); self.assertEqual(stats['failed_pages'], [1])
+        fetcher.fetch_page.assert_not_called()
+
     def test_permanent_400_is_not_retried_and_explains_schema_error(self):
         fetcher = CMS.CMSFetcher('https://example.invalid/graphql', '')
         response = requests.Response(); response.status_code = 400
@@ -198,6 +206,13 @@ class WebsiteReliabilityTests(unittest.TestCase):
 
 
 class SitemapTraversalTests(unittest.TestCase):
+    def test_discovery_deadline_is_visible_and_bounded(self):
+        crawler = WP.SitemapCrawler(delay=0)
+        crawler.fetch_sitemap = Mock()
+        result = crawler.crawl_site('Example', 'https://example.com/sitemap.xml', deadline=0)
+        self.assertFalse(result['complete'])
+        self.assertIn('time budget', result['error'])
+        crawler.fetch_sitemap.assert_not_called()
     def test_navigation_sitemap_is_explicitly_skipped_not_parsed_as_content(self):
         crawler = WP.SitemapCrawler(delay=0)
         root, tags = 'https://example.com/sitemap.xml', 'https://example.com/post_tag-sitemap3.xml'

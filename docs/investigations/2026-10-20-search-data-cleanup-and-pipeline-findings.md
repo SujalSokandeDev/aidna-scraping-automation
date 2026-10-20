@@ -109,7 +109,9 @@ Permanent corrections must address the authoritative CMS/source or a reviewed pi
 - [Update a document](https://docs.cloud.google.com/generative-ai-app-builder/docs/reference/rest/v1/projects.locations.collections.dataStores.branches.documents/patch)
 - [Delete a document](https://docs.cloud.google.com/generative-ai-app-builder/docs/reference/rest/v1/projects.locations.collections.dataStores.branches.documents/delete)
 
-## Pipeline #11: Actual Progress Versus Remaining Work
+## Pipeline #11: Discovery Snapshot Before Implementation
+
+The following assessment records the state before implementation began on 20 October. Subsequent implementation and live verification are recorded in `../pipeline-operations.md` and the repair pull request. Statements below about uncommitted changes or outstanding tests describe that earlier snapshot, not the latest release status.
 
 ### Available / Verified
 

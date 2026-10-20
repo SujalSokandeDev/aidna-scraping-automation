@@ -388,6 +388,7 @@ class CMSPipeline:
             Statistics dictionary
         """
         crawl_id = f"cms_crawl_{uuid.uuid4().hex}"
+        deadline = time.monotonic() + max(60, int(os.getenv('PIPELINE_MAX_SECONDS', '3300')))
         if not self.dry_run:
             self.db.check_ready()
         if not self.dry_run:
@@ -438,6 +439,7 @@ class CMSPipeline:
                 self.config.businessabc_token if cms_key == 'businessabc' else self.config.sportsabc_token,
                 self.logger
             )
+            fetcher.deadline = deadline
             
             source_stats = []
             

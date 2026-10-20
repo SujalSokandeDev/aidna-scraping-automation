@@ -91,7 +91,7 @@ class WordPressPipeline:
         deadline = time.monotonic() + self.max_seconds
         upload_reserve = min(120, self.max_seconds / 4)
         try:
-            discovery = self.crawler.crawl_site(site_name, site_info['sitemap'])
+            discovery = self.crawler.crawl_site(site_name, site_info['sitemap'], deadline=deadline - upload_reserve)
             stats['discovered'] = len(discovery['urls'])
             stats['discovery_errors'] = discovery.get('errors', [])
             stats['ignored_navigation_sitemaps'] = discovery.get('ignored_navigation_sitemaps', [])

@@ -6,7 +6,6 @@ Contains all GraphQL queries and response key mappings.
 
 import time
 import requests
-import re
 from typing import Dict, List, Tuple, Optional, Any
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception
 
@@ -1606,6 +1605,7 @@ class CMSFetcher:
         """
         self.graphql_url = graphql_url
         self.logger = logger
+        self.deadline = None
         self.session = requests.Session()
         self.session.headers.update({
             'Authorization': f'Bearer {bearer_token}',
@@ -1700,7 +1700,6 @@ class CMSFetcher:
         all_records = []
         current_page = start_page
         total_pages = None
-        consecutive_failures = 0
         stats = {
             'total_fetched': 0,
             'failed_pages': [],
@@ -1713,6 +1712,8 @@ class CMSFetcher:
         
         while True:
             try:
+                if self.deadline is not None and time.monotonic() >= self.deadline:
+                    raise TimeoutError('CMS discovery time budget exhausted; extraction is incomplete')
                 result = self.fetch_page(query, response_key, current_page, page_size)
                 records = result['data']
                 pagination = result['meta']['pagination']
@@ -1737,7 +1738,6 @@ class CMSFetcher:
                     stats['total_fetched'] += len(records)
                 
                 stats['end_page'] = current_page
-                consecutive_failures = 0
                 
                 self._log('info', f"Page {current_page}/{total_pages}: Fetched {len(records)} records")
                 

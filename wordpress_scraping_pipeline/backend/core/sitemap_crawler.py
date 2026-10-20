@@ -243,11 +243,14 @@ class SitemapCrawler:
         return all_urls
     
     def crawl_site(self, site_name: str, sitemap_url: str, 
-                   filter_urls: bool = True) -> Dict[str, any]:
+                   filter_urls: bool = True, deadline=None) -> Dict[str, any]:
         """Traverse nested indexes without hiding failed children or following cycles."""
         pending, visited, found, errors, ignored = [sitemap_url], set(), {}, [], []
         host = (urlparse(sitemap_url).hostname or '').removeprefix('www.')
         while pending:
+            if deadline is not None and time.monotonic() >= deadline:
+                errors.append('Sitemap discovery time budget exhausted; extraction is incomplete')
+                break
             url = pending.pop()
             if url in visited:
                 continue

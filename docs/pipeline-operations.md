@@ -38,6 +38,7 @@ Existing tables from `supabase_schema.sql` are used; no destructive migration is
 `AIDNA Nightly Scrape` runs nightly and can be dispatched manually with `target=cms|wp|both`, `mode=incremental|full`, and a positive `limit`. Start with `limit=1` for a live smoke test. The limit is per CMS collection or website, not a total across all jobs.
 
 CMS sources and websites have independent matrix jobs. A source failure does not cancel unrelated sources; the final result is not green if a selected job failed, was cancelled, or never executed. Global workflow concurrency serializes runs to avoid overlapping state updates.
+Discovery is also time-bounded through `PIPELINE_MAX_SECONDS` (CMS default 3,300 seconds; website workflow 2,400 seconds). Exhausting discovery time produces an explicit incomplete-extraction error, preserving valid delivery and retryable state rather than relying on the runner timeout.
 
 Both modes rediscover sources non-destructively. CMS compares content hashes and retries changed/failed/untracked records. Websites retry failed/untracked records and refresh successful ones when sitemap lastmod is newer. Legacy successful records without a hash are refreshed once. A site with no lastmod cannot advertise later edits reliably; periodic explicit revalidation is a separate operational decision.
 
@@ -47,6 +48,20 @@ Review every job summary and its `report-*.json` artifact. Reports include disco
 
 No changes here rebrand historical article text or purge search results. Those findings remain separate in `docs/investigations/2026-10-20-search-data-cleanup-and-pipeline-findings.md`.
 
+## Live verification on 20 October 2026
+
+Repair PR: https://github.com/SujalSokandeDev/aidna-scraping-automation/pull/1 .
+
+Initial controlled run: https://github.com/SujalSokandeDev/aidna-scraping-automation/actions/runs/39456378391 .
+
+- SportsABC: all seven collections passed; seven genuine records were delivered to `unified_cms_content_combined` with `SDNA` source and their original content types. BigQuery readback and Supabase success-state readback were confirmed.
+- All five website jobs delivered a genuine published record to `unified_all_cms_content` with their existing `WordPress/<site>` source tags and `post` content type.
+- The first IntelligentHQ job correctly reported incomplete discovery because its tag-navigation sitemap served HTML. The follow-up excludes navigation-only children explicitly. Live read-only retesting then found 12,303 eligible content URLs with no discovery errors.
+- Follow-up website verification is queued behind the initial run to avoid overlapping writes. BusinessABC's larger CMS crawl is still pending at the time of this entry; do not infer complete CMS verification from SportsABC alone.
+- These checks ingest genuine content, not synthetic production records. They must not be deleted as test cleanup. The only temporary database entries are uniquely scoped readiness checkpoints, removed by the readiness checks.
+- Historical backlogs remain. Bounded delivery and passing connection checks do not imply every record is already current, or that Vertex has reindexed the content.
+- Server-side redirects remain Neeraj's separate responsibility. The scraper entrypoint fixes do not deploy website redirects.
+
 ## Tests
 
-Install the two requirements files plus PyYAML in an isolated Python environment, then run `python -m unittest discover -s tests -v`. Tests cover pagination failures, permanent errors, safe retry/resume, state ordering, dry-run isolation, sitemap traversal, identity collisions, verified MERGE delivery, and independent workflow jobs. Live delivery verification is additionally required before declaring the production pipeline healthy.
+Install the two requirements files plus PyYAML in an isolated Python environment, then run `python -m unittest discover -s tests -v`. The 37 tests cover pagination failures, permanent errors, discovery deadlines, safe retry/resume, state ordering, mixed existing/new tracking batches, dry-run isolation, sitemap traversal, identity collisions, large-batch splitting, verified MERGE delivery, and independent workflow jobs. Live delivery verification is additionally required before declaring the production pipeline healthy.
