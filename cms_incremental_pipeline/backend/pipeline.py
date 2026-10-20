@@ -16,12 +16,16 @@ import argparse
 import json
 import sys
 import time
+import os
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 # Add parent to path
 sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from pipeline_runtime import content_hash, utc_now, timestamp
 
 from utils.config import Config, CMS_SOURCES
 from utils.logger import setup_logging, get_logger
@@ -69,6 +73,8 @@ class CMSPipeline:
         # To enable, use --with-wikipedia flag (if implemented) or set to True
         self.enable_wikipedia = False
         self.wikipedia_max_images = 7
+        self.max_records = max(1, int(os.getenv("PIPELINE_RECORD_LIMIT", "200")))
+        self.delivery_manifest = []
     
     @property
     def bq_manager(self):
@@ -145,11 +151,14 @@ class CMSPipeline:
                         page_size=1, max_records=1
                     )
                     count = stats.get('total_available', 0)
+                    if stats.get('failed_pages'):
+                        raise RuntimeError(stats.get('error', 'Collection readiness failed'))
                     total_records += count
                     status = "✅" if count > 0 else "⚠️"
                     self.logger.info(f"   {status} {collection:15} │ {count:,} records")
                 except Exception as e:
                     self.logger.warning(f"   ❌ {collection:15} │ Error: {str(e)[:30]}")
+                    all_ok = False
             
             self.logger.info(f"   ─────────────────────┼───────────────")
             self.logger.info(f"   📊 Total             │ {total_records:,} records")
@@ -185,11 +194,14 @@ class CMSPipeline:
                         page_size=1, max_records=1
                     )
                     count = stats.get('total_available', 0)
+                    if stats.get('failed_pages'):
+                        raise RuntimeError(stats.get('error', 'Collection readiness failed'))
                     total_records += count
                     status = "✅" if count > 0 else "⚠️"
                     self.logger.info(f"   {status} {collection:15} │ {count:,} records")
                 except Exception as e:
                     self.logger.warning(f"   ❌ {collection:15} │ Error: {str(e)[:30]}")
+                    all_ok = False
             
             self.logger.info(f"   ─────────────────────┼───────────────")
             self.logger.info(f"   📊 Total             │ {total_records:,} records")
@@ -225,20 +237,20 @@ class CMSPipeline:
         
         # Test SQLite
         self.logger.info("─" * 70)
-        self.logger.info("📋 STEP 5: SQLite Database")
+        self.logger.info("STEP 5: Supabase state storage")
         self.logger.info("─" * 70)
         try:
             stats = self.db.get_stats()
-            self.logger.info(f"   📁 Database: {self.config.records_db_path}")
+            self.db.check_ready()
             self.logger.info(f"   📊 Total Records Tracked: {stats['total_records']:,}")
             self.logger.info(f"   ✅ Success: {stats['success']:,}")
             self.logger.info(f"   ⏳ Pending: {stats['pending']:,}")
             self.logger.info(f"   ❌ Failed: {stats['failed']:,}")
             if stats['last_scraped']:
                 self.logger.info(f"   🕐 Last Scraped: {stats['last_scraped']}")
-            self.logger.info("✅ SQLite database accessible")
+            self.logger.info("Supabase read/write/checkpoint readiness confirmed")
         except Exception as e:
-            self.logger.error(f"❌ SQLite error: {e}")
+            self.logger.error(f"Supabase readiness error: {e}")
             all_ok = False
         self.logger.info("")
         
@@ -375,7 +387,12 @@ class CMSPipeline:
         Returns:
             Statistics dictionary
         """
-        crawl_id = f"cms_crawl_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        crawl_id = f"cms_crawl_{uuid.uuid4().hex}"
+        deadline = time.monotonic() + max(60, int(os.getenv('PIPELINE_MAX_SECONDS', '3300')))
+        if not self.dry_run:
+            self.db.check_ready()
+        if not self.dry_run:
+            self.bq_manager.test_connection()
         
         self.logger.info("=" * 70)
         self.logger.info(f"CMS INCREMENTAL PIPELINE - {mode.upper()} MODE")
@@ -412,7 +429,9 @@ class CMSPipeline:
             self.logger.info("=" * 70)
             
             # Create checkpoint
-            self.db.create_checkpoint(crawl_id, source_tag, mode)
+            source_crawl_id = f"{crawl_id}_{cms_key}"
+            if not self.dry_run:
+                self.db.create_checkpoint(source_crawl_id, source_tag, mode)
             
             # Initialize fetcher
             fetcher = CMSFetcher(
@@ -420,6 +439,7 @@ class CMSPipeline:
                 self.config.businessabc_token if cms_key == 'businessabc' else self.config.sportsabc_token,
                 self.logger
             )
+            fetcher.deadline = deadline
             
             source_stats = []
             
@@ -434,8 +454,10 @@ class CMSPipeline:
                 
                 # Update checkpoint
                 total_processed = sum(s.get('inserted', 0) for s in source_stats)
-                self.db.update_checkpoint(
-                    crawl_id,
+                if not self.dry_run:
+                    self.db.update_checkpoint(
+                    source_crawl_id,
+                    total=sum(s.get('fetched', 0) for s in source_stats),
                     processed=total_processed,
                     successful=total_processed,
                     status='running'
@@ -446,17 +468,27 @@ class CMSPipeline:
             # Mark checkpoint complete
             total_success = sum(s.get('inserted', 0) for s in source_stats)
             total_failed = sum(s.get('failed', 0) for s in source_stats)
-            self.db.update_checkpoint(
-                crawl_id,
+            if not self.dry_run:
+                self.db.update_checkpoint(
+                source_crawl_id,
+                total=sum(s.get('fetched', 0) for s in source_stats),
                 processed=total_success + total_failed,
                 successful=total_success,
                 failed=total_failed,
-                status='completed' if not self.stop_requested else 'cancelled'
+                status='cancelled' if self.stop_requested else ('failed' if any(s.get('status') == 'failed' for s in source_stats) else 'completed')
             )
             
             all_stats['sources'][cms_key] = source_stats
         
         all_stats['end_time'] = datetime.now().isoformat()
+        all_stats['delivery_manifest'] = self.delivery_manifest
+        all_stats['status'] = 'failed' if self.stop_requested or any(
+            c.get('status') == 'failed' for rows in all_stats['sources'].values() for c in rows
+        ) else ('dry_run' if self.dry_run else 'backlog' if any(
+            c.get('deferred') for rows in all_stats['sources'].values() for c in rows) else 'completed')
+        report_path = Path(os.getenv('PIPELINE_REPORT_PATH', self.config.base_dir / 'logs' / 'cms-report.json'))
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(json.dumps(all_stats, indent=2), encoding='utf-8')
         
         # Print summary
         self._print_summary(all_stats)
@@ -466,163 +498,75 @@ class CMSPipeline:
     def _process_collection(self, fetcher: CMSFetcher, cms_key: str,
                            collection: str, source_tag: str,
                            mode: str) -> Dict:
-        """
-        Process a single collection with detailed logging.
-        
-        Returns:
-            Statistics dictionary for this collection
-        """
-        start_time = datetime.now()
-        
-        self.logger.info("")
-        self.logger.info("─" * 60)
-        self.logger.info(f"📦 COLLECTION: {collection.upper()}")
-        self.logger.info("─" * 60)
-        self.logger.info(f"   Source: {source_tag}")
-        self.logger.info(f"   Mode: {mode}")
-        self.logger.info(f"   Started: {start_time.strftime('%H:%M:%S')}")
-        
-        stats = {
-            'collection': collection,
-            'source': source_tag,
-            'fetched': 0,
-            'new': 0,
-            'processed': 0,
-            'inserted': 0,
-            'failed': 0,
-            'status': 'started'
-        }
-        
+        """Reconcile changed content in bounded batches; commit state after confirmed delivery."""
+        stats = dict(collection=collection, source=source_tag, fetched=0, processed=0,
+                     downloaded=0, inserted=0, failed=0, skipped=0, deferred=0, status='started')
         try:
-            # Step 1: Fetch records from API
-            self.logger.info("")
-            self.logger.info(f"   📥 STEP 1: Fetching from API...")
-            records, fetch_stats = fetcher.fetch_collection(
-                cms_key, collection,
-                page_size=self.config.page_size,
-                delay=self.config.request_delay
-            )
-            
+            records, fetch_stats = fetcher.fetch_inventory(
+                cms_key, collection, page_size=self.config.page_size, delay=self.config.request_delay)
             stats['fetched'] = len(records)
-            pages = fetch_stats.get('total_pages', 0)
-            self.logger.info(f"      ✅ Fetched {len(records):,} records ({pages} pages)")
-            
-            if not records:
-                self.logger.info(f"      ⚠️ No records found in API")
-                stats['status'] = 'no_records'
-                return stats
-            
-            # Step 2: Track in database
-            self.logger.info("")
-            self.logger.info(f"   💾 STEP 2: Tracking in SQLite...")
-            new_count = self.db.add_records_batch(records, source_tag, cms_key, collection)
-            stats['new'] = new_count
-            self.logger.info(f"      ✅ {new_count:,} new records added to tracking")
-            
-            # Step 3: Filter for incremental mode
-            if mode == 'incremental':
-                self.logger.info("")
-                self.logger.info(f"   🔍 STEP 3: Filtering pending records...")
-                pending = self.db.get_pending_records(source=source_tag, collection=collection)
-                pending_ids = {r['strapi_id'] for r in pending}
-                records = [r for r in records if str(r['id']) in pending_ids]
-                self.logger.info(f"      ✅ {len(records):,} pending records to process")
-            
-            if not records:
-                self.logger.info(f"      ⏭️ All records already processed")
-                stats['status'] = 'completed'
-                return stats
-            
-            # Step 4: Process content
-            self.logger.info("")
-            self.logger.info(f"   ⚙️ STEP 4: Processing content...")
-            processed_records = self.processor.process_batch(records, collection, source_tag, cms_key)
-            stats['processed'] = len(processed_records)
-            self.logger.info(f"      ✅ {len(processed_records):,} records cleaned & structured")
-            # Step 5: Wikipedia images
-            skip_wikipedia_types = {'nationality', 'knowledgebase', 'post'}
-            if self.enable_wikipedia and collection.lower() not in skip_wikipedia_types:
-                self.logger.info("")
-                self.logger.info(f"   🖼️ STEP 5: Enriching with Wikipedia images...")
-                try:
-                    # Enrich each record individually as per unified pipeline logic
-                    enriched_count = 0
-                    for idx, record in enumerate(processed_records):
-                        self.wikipedia.augment_record(record)
-                        if record.get('external_images'):
-                            enriched_count += 1
-                        
-                        # Convert to JSON string for BigQuery
-                        record['external_images'] = json.dumps(record.get('external_images', []))
-                        
-                        # Log progress every 10 records to keep user informed
-                        if (idx + 1) % 10 == 0:
-                            self.logger.info(f"      ...processed {idx + 1}/{len(processed_records)} records")
-                            
-                    self.logger.info(f"      ✅ Enriched {enriched_count:,} records with images")
-                except Exception as wiki_err:
-                    self.logger.warning(f"      ⚠️ Wikipedia enrichment failed: {wiki_err}")
-                    for record in processed_records:
-                        record['external_images'] = json.dumps([])
-            else:
-                self.logger.info("")
-                self.logger.info(f"   🖼️ STEP 5: Skipping Wikipedia (not applicable for {collection})")
-                for record in processed_records:
-                    record['external_images'] = json.dumps([])
-            
-            # Step 6: Insert into BigQuery
-            self.logger.info("")
-            self.logger.info(f"   ☁️ STEP 6: Inserting into BigQuery...")
-            self.logger.info(f"      Batch size: {self.config.insert_batch_size}")
-            inserted, failed = self.bq_manager.insert_batch(
-                processed_records,
-                batch_size=self.config.insert_batch_size,
-                source=source_tag,
-                collection=collection
-            )
-            
-            stats['inserted'] = inserted
-            stats['failed'] = failed
-            
-            # Step 7: Update tracking database
-            self.logger.info("")
-            self.logger.info(f"   📝 STEP 7: Updating tracking status...")
-            for record in processed_records:
-                record_id = f"{cms_key}_{collection}_{record['id']}"
-                self.db.mark_record_scraped(
-                    record_id,
-                    status='success' if failed == 0 else 'success',
-                    bigquery_id=record['id']
-                )
-            
-            stats['status'] = 'completed'
-            
-            # Collection Summary
-            end_time = datetime.now()
-            duration = (end_time - start_time).total_seconds()
-            
-            self.logger.info("")
-            self.logger.info("─" * 60)
-            self.logger.info(f"✅ COLLECTION COMPLETE: {collection.upper()}")
-            self.logger.info("─" * 60)
-            self.logger.info(f"   📊 Records Fetched:   {stats['fetched']:,}")
-            self.logger.info(f"   📊 Records Processed: {stats['processed']:,}")
-            self.logger.info(f"   ✅ Inserted:          {inserted:,}")
-            if failed > 0:
-                self.logger.info(f"   ❌ Failed:            {failed:,}")
-            self.logger.info(f"   ⏱️ Duration:          {duration:.1f}s")
-            self.logger.info("")
-            
-        except Exception as e:
-            self.logger.error("")
-            self.logger.error("─" * 60)
-            self.logger.error(f"❌ COLLECTION FAILED: {collection.upper()}")
-            self.logger.error("─" * 60)
-            self.logger.error(f"   Error: {e}")
-            self.logger.error("")
+            stats['failed_pages'] = fetch_stats.get('failed_pages', [])
+            tracking = self.db.tracking_records(source_tag, collection)
+            pending = []
+            for record in records:
+                key = f"{cms_key}_{collection}_{record['id']}"
+                previous = tracking.get(key, {})
+                modified = timestamp((record.get('attributes') or {}).get('updatedAt'))
+                scraped = timestamp(previous.get('last_scraped'))
+                if (mode == 'full' or previous.get('scrape_status') != 'success' or not previous.get('content_hash')
+                        or not modified or not scraped or modified > scraped):
+                    pending.append((record, key, previous))
+                else:
+                    stats['skipped'] += 1
+            # Previously untracked records take precedence over legacy hash refreshes.
+            pending.sort(key=lambda item: (bool(item[2]), item[2].get('last_scraped') or '', str(item[0]['id'])))
+            stats['eligible'] = len(pending)
+            stats['deferred'] = max(0, len(pending) - self.max_records)
+            pending = pending[:self.max_records]
+            for offset in range(0, len(pending), self.config.insert_batch_size):
+                if self.stop_requested:
+                    raise RuntimeError('Interrupted; remaining records will resume next run')
+                batch = pending[offset:offset + self.config.insert_batch_size]
+                downloaded = fetcher.fetch_records(cms_key, collection, [row[0]['id'] for row in batch])
+                full_records = {str(row['id']): row for row in downloaded}
+                stats['downloaded'] += len(downloaded)
+                prepared, states = [], []
+                for inventory, key, previous in batch:
+                    raw = full_records[str(inventory['id'])]
+                    digest = content_hash(raw)
+                    record = self.processor.structure_record(raw, collection, source_tag, cms_key)
+                    # Preserve optional historical image enrichment on existing rows during refresh.
+                    record['external_images'] = None
+                    prepared.append(record)
+                    states.append({**previous, 'record_id': key, 'source': source_tag, 'cms_key': cms_key,
+                        'collection': collection, 'strapi_id': str(raw['id']), 'title': record['title'],
+                        'published_at': record['published_at'], 'scrape_status': 'success',
+                        'content_hash': digest, 'last_scraped': utc_now(), 'bigquery_id': record['id'], 'error_message': None})
+                stats['processed'] += len(prepared)
+                if self.dry_run:
+                    continue
+                inserted, failed, errors = self.bq_manager.insert_records(prepared)
+                if failed or inserted != len(prepared):
+                    stats['failed'] += len(prepared)
+                    message = 'BigQuery delivery failed: ' + '; '.join(errors)
+                    self.logger.error(f'{cms_key}/{collection}: {message}')
+                    for state in states:
+                        state.update(scrape_status='failed', error_message=message[:1000])
+                    self.db.confirm_records(states)
+                    stats.setdefault('delivery_errors', []).append(message)
+                    continue
+                stats['inserted'] += inserted
+                self.db.confirm_records(states)
+                self.delivery_manifest.extend({k: record[k] for k in ('id', 'source', 'content_type', 'processing_timestamp')} for record in prepared)
+            if fetch_stats.get('failed_pages') or not fetch_stats.get('complete'):
+                raise RuntimeError('Incomplete extraction: ' + str(fetch_stats.get('error', 'pagination incomplete')))
+            stats['status'] = 'failed' if stats['failed'] else 'dry_run' if self.dry_run else 'completed'
+        except Exception as error:
+            self.logger.error(f"{cms_key}/{collection} failed: {error}")
             stats['status'] = 'failed'
-            stats['error'] = str(e)
-        
+            stats['error'] = str(error)
+        stats['deferred'] = max(0, stats.get('eligible', 0) - stats['processed'])
+        self.logger.info(json.dumps(stats))
         return stats
     
     def _print_summary(self, stats: Dict):
@@ -689,26 +633,32 @@ def main():
                        help='Dry run (no BigQuery insert)')
     parser.add_argument('--no-wikipedia', action='store_true',
                        help='Disable Wikipedia image enrichment')
+    parser.add_argument('--limit', type=int, help='Maximum changed records delivered per collection this run')
     
     args = parser.parse_args()
     
     pipeline = CMSPipeline(dry_run=args.dry_run)
+    if args.limit is not None:
+        if args.limit < 1:
+            parser.error('--limit must be positive')
+        pipeline.max_records = args.limit
     
     # Apply Wikipedia setting
     if args.no_wikipedia:
         pipeline.enable_wikipedia = False
     
     if args.diagnostics:
-        pipeline.run_diagnostics()
+        sys.exit(0 if pipeline.run_diagnostics() else 1)
     elif args.stats:
         pipeline.show_stats(args.source)
     elif args.check_new:
         pipeline.check_new_records(args.source)
     elif args.mode:
         if args.mode == 'incremental':
-            pipeline.run_incremental_scrape(args.source, args.collection)
+            result = pipeline.run_incremental_scrape(args.source, args.collection)
         else:
-            pipeline.run_full_scrape(args.source, args.collection)
+            result = pipeline.run_full_scrape(args.source, args.collection)
+        sys.exit(1 if result['status'] == 'failed' else 0)
     else:
         parser.print_help()
 

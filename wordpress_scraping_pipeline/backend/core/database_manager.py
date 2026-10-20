@@ -5,6 +5,10 @@ API is identical to the original SQLite version so pipeline.py requires zero cha
 """
 
 import hashlib
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+from pipeline_runtime import read_tracking, confirm_tracking, check_state_store
 from datetime import datetime
 from typing import List, Dict, Optional, Tuple, Any
 
@@ -39,6 +43,15 @@ class DatabaseManager:
 
         self.client: Client = create_client(url, key)
 
+    def check_ready(self):
+        check_state_store(self.client, self.URLS_TABLE, "url", "wp")
+
+    def tracking_records(self, source):
+        return read_tracking(self.client, self.URLS_TABLE, "url", source=source)
+
+    def confirm_urls(self, rows):
+        confirm_tracking(self.client, self.URLS_TABLE, "url", rows)
+
     # =========================================================================
     # URL TRACKING METHODS
     # =========================================================================
@@ -59,7 +72,7 @@ class DatabaseManager:
             ).execute()
             return True
         except Exception:
-            return False
+            raise RuntimeError("URL tracking write failed") from None
 
     def add_urls_batch(self, urls: List[Dict[str, Any]], source: str) -> int:
         """Add multiple URLs. Returns count of new URLs added."""
@@ -86,7 +99,7 @@ class DatabaseManager:
                 ).execute()
                 added += len(resp.data) if resp.data else 0
             except Exception:
-                pass
+                raise RuntimeError("URL tracking batch write failed") from None
 
         return added
 
@@ -112,7 +125,7 @@ class DatabaseManager:
 
     def get_pending_urls(self, source: str = None, limit: int = None) -> List[str]:
         """Get URLs with scrape_status='pending'."""
-        query = self.client.table(self.URLS_TABLE).select("url").eq("scrape_status", "pending")
+        query = self.client.table(self.URLS_TABLE).select("url").in_("scrape_status", ["pending", "failed"])
         if source:
             query = query.eq("source", source)
 
@@ -190,7 +203,7 @@ class DatabaseManager:
             )
             return bool(resp.data)
         except Exception:
-            return False
+            raise RuntimeError("URL tracking status update failed") from None
 
     def sync_with_sitemap(self, sitemap_urls: List[str], source: str) -> int:
         """Remove URLs from database that no longer exist in sitemap."""
@@ -217,7 +230,7 @@ class DatabaseManager:
             ).execute()
             stats = resp.data if resp.data else {}
         except Exception:
-            stats = {}
+            raise RuntimeError("URL state statistics unavailable") from None
 
         # Get site breakdown if no filter
         sites_breakdown = {}
@@ -226,7 +239,7 @@ class DatabaseManager:
                 resp2 = self.client.rpc("aidna_wp_get_breakdown").execute()
                 sites_breakdown = resp2.data if resp2.data else {}
             except Exception:
-                pass
+                raise RuntimeError("URL state breakdown unavailable") from None
 
         return {
             "total_urls": stats.get("total_urls", 0),
@@ -274,7 +287,7 @@ class DatabaseManager:
             self.client.table(self.URLS_TABLE).delete().eq("url", url).execute()
             return True
         except Exception:
-            return False
+            raise RuntimeError("URL tracking deletion failed") from None
 
     # =========================================================================
     # CHECKPOINT METHODS
@@ -295,7 +308,7 @@ class DatabaseManager:
             }).execute()
             return True
         except Exception:
-            return False
+            raise RuntimeError("URL checkpoint creation failed") from None
 
     def update_checkpoint(self, crawl_id: str, processed: int = None,
                           successful: int = None, failed: int = None,

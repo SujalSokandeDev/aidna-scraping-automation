@@ -7,7 +7,7 @@ import re
 import time
 import xml.etree.ElementTree as ET
 from typing import List, Dict, Optional, Set
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -72,7 +72,7 @@ class SitemapCrawler:
             read=self.max_retries,
             connect=self.max_retries,
             backoff_factor=1,
-            status_forcelist=[500, 502, 503, 504]
+            status_forcelist=[429, 500, 502, 503, 504]
         )
         
         adapter = HTTPAdapter(max_retries=retry)
@@ -128,8 +128,7 @@ class SitemapCrawler:
             return []
         
         except ET.ParseError as e:
-            print(f"Failed to parse sitemap index: {e}")
-            return []
+            raise ValueError("Invalid sitemap XML") from e
     
     def parse_sitemap_urls(self, xml_content: str) -> List[Dict[str, str]]:
         """
@@ -157,7 +156,7 @@ class SitemapCrawler:
                     })
         
         except ET.ParseError as e:
-            print(f"Failed to parse sitemap URLs: {e}")
+            raise ValueError("Invalid sitemap URL-set XML") from e
         
         return urls_data
     
@@ -244,73 +243,55 @@ class SitemapCrawler:
         return all_urls
     
     def crawl_site(self, site_name: str, sitemap_url: str, 
-                   filter_urls: bool = True) -> Dict[str, any]:
-        """
-        Crawl a WordPress site's sitemap.
-        
-        Args:
-            site_name: Name of the site (for logging)
-            sitemap_url: URL of the sitemap index
-            filter_urls: Whether to filter out taxonomy URLs
-        
-        Returns:
-            Dict with crawl results:
-            - urls: List of URL dicts
-            - total_found: Total URLs found in sitemap
-            - total_filtered: Number of URLs after filtering
-            - skipped: Number of URLs skipped
-        """
-        print(f"Crawling sitemap for {site_name}: {sitemap_url}")
-        
-        # Get all URLs
-        all_urls = []
-        
-        xml_content = self.fetch_sitemap(sitemap_url)
-        if not xml_content:
-            return {
-                'urls': [],
-                'total_found': 0,
-                'total_filtered': 0,
-                'skipped': 0,
-                'error': f"Failed to fetch sitemap: {sitemap_url}"
-            }
-        
-        # Check if it's a sitemap index
-        sub_sitemaps = self.parse_sitemap_index(xml_content)
-        
-        if sub_sitemaps:
-            print(f"  Found {len(sub_sitemaps)} sub-sitemaps")
-            for i, sub_url in enumerate(sub_sitemaps):
-                time.sleep(self.delay)
-                
-                sub_xml = self.fetch_sitemap(sub_url)
-                if sub_xml:
-                    urls = self.parse_sitemap_urls(sub_xml)
-                    all_urls.extend(urls)
-                    print(f"  [{i+1}/{len(sub_sitemaps)}] {len(urls)} URLs from {sub_url.split('/')[-1]}")
-        else:
-            urls = self.parse_sitemap_urls(xml_content)
-            all_urls.extend(urls)
-        
-        total_found = len(all_urls)
-        
-        # Filter URLs
-        if filter_urls:
-            filtered_urls = self.filter_content_urls(all_urls)
-        else:
-            filtered_urls = all_urls
-        
-        total_filtered = len(filtered_urls)
-        skipped = total_found - total_filtered
-        
-        print(f"  Total: {total_found} URLs | Content: {total_filtered} | Skipped: {skipped}")
-        
-        return {
-            'urls': filtered_urls,
-            'total_found': total_found,
-            'total_filtered': total_filtered,
-            'skipped': skipped
-        }
+                   filter_urls: bool = True, deadline=None) -> Dict[str, any]:
+        """Traverse nested indexes without hiding failed children or following cycles."""
+        pending, visited, found, errors, ignored = [sitemap_url], set(), {}, [], []
+        host = (urlparse(sitemap_url).hostname or '').removeprefix('www.')
+        while pending:
+            if deadline is not None and time.monotonic() >= deadline:
+                errors.append('Sitemap discovery time budget exhausted; extraction is incomplete')
+                break
+            url = pending.pop()
+            if url in visited:
+                continue
+            if len(visited) >= 500:
+                errors.append('Sitemap traversal limit reached; extraction is incomplete')
+                break
+            visited.add(url)
+            try:
+                parsed = urlparse(url)
+                if parsed.scheme not in ('http', 'https') or (parsed.hostname or '').removeprefix('www.') != host:
+                    raise ValueError('Cross-site sitemap reference rejected')
+                # These children contain only navigation URLs already excluded by the content filter.
+                if filter_urls and re.search(r'/(category|post_tag|author|attachment)-sitemap\d*\.xml$', parsed.path):
+                    ignored.append(url)
+                    continue
+                xml = self.fetch_sitemap(url)
+                if not xml:
+                    raise ValueError(f'Sitemap fetch failed: {url}')
+                root = ET.fromstring(xml)
+                kind = root.tag.rsplit('}', 1)[-1]
+                if kind == 'sitemapindex':
+                    pending.extend(urljoin(url, child) for child in self.parse_sitemap_index(xml))
+                elif kind == 'urlset':
+                    for item in self.parse_sitemap_urls(xml):
+                        item_url = urlparse(item['url'])
+                        if item_url.scheme not in ('http', 'https') or (item_url.hostname or '').removeprefix('www.') != host:
+                            raise ValueError('Cross-site content URL rejected')
+                        found[item['url']] = {**item, 'sitemap_url': url}
+                else:
+                    raise ValueError('Response is not sitemap XML')
+            except Exception as error:
+                errors.append(f'{url}: {error}')
+            time.sleep(self.delay)
+        urls = list(found.values())
+        filtered = self.filter_content_urls(urls) if filter_urls else urls
+        result = {'urls': filtered, 'total_found': len(urls), 'total_filtered': len(filtered),
+                  'skipped': len(urls) - len(filtered), 'errors': errors, 'complete': not errors,
+                  'ignored_navigation_sitemaps': ignored}
+        if errors:
+            result['error'] = '; '.join(errors[:5])
+        return result
     
     def get_url_list(self, urls_data: List[Dict[str, str]]) -> List[str]:
         """Extract just the URL strings from URL data list."""

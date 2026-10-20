@@ -407,6 +407,7 @@ class ContentScraper:
         
         return {
             'url': url,
+            'is_attachment': bool(soup.body and set(soup.body.get('class', [])) & {'attachment', 'single-attachment', 'attachment-template-default'}),
             'slug': self.extract_slug(url),
             'title': metadata['title'],
             'description': metadata['description'],

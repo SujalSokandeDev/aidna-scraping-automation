@@ -97,7 +97,7 @@ class Config:
             # BigQuery
             gcp_project_id=os.getenv("GCP_PROJECT_ID", "ztudiumplatforms"),
             bigquery_dataset=os.getenv("BIGQUERY_DATASET", "strapi_content_data"),
-            bigquery_table=os.getenv("BIGQUERY_TABLE", "unified_cms_only"),
+            bigquery_table=os.getenv("BIGQUERY_TABLE", "unified_cms_content_combined"),
             google_credentials_path=os.getenv("GOOGLE_CREDENTIALS_PATH", str(data_dir / "service-account.json")),
             # Pipeline
             page_size=int(os.getenv("PAGE_SIZE", "100")),

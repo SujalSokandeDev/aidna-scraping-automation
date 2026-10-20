@@ -5,6 +5,10 @@ API is identical to the original SQLite version so pipeline.py requires zero cha
 """
 
 import hashlib
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+from pipeline_runtime import read_tracking, confirm_tracking, check_state_store
 from datetime import datetime
 from typing import List, Dict, Optional, Any
 
@@ -39,6 +43,15 @@ class DatabaseManager:
 
         self.client: Client = create_client(url, key)
 
+    def check_ready(self):
+        check_state_store(self.client, self.RECORDS_TABLE, "record_id", "cms")
+
+    def tracking_records(self, source, collection):
+        return read_tracking(self.client, self.RECORDS_TABLE, "record_id", source=source, collection=collection)
+
+    def confirm_records(self, rows):
+        confirm_tracking(self.client, self.RECORDS_TABLE, "record_id", rows)
+
     # =========================================================================
     # RECORD TRACKING METHODS
     # =========================================================================
@@ -62,7 +75,7 @@ class DatabaseManager:
             ).execute()
             return True
         except Exception:
-            return False
+            raise RuntimeError("CMS tracking write failed") from None
 
     def add_records_batch(self, records: List[Dict[str, Any]], source: str,
                           cms_key: str, collection: str) -> int:
@@ -99,14 +112,14 @@ class DatabaseManager:
                 ).execute()
                 added += len(resp.data) if resp.data else 0
             except Exception:
-                pass
+                raise RuntimeError("CMS tracking batch write failed") from None
 
         return added
 
     def get_pending_records(self, source: str = None, collection: str = None,
                            limit: int = None) -> List[Dict]:
         """Get records with scrape_status='pending'."""
-        query = self.client.table(self.RECORDS_TABLE).select("*").eq("scrape_status", "pending")
+        query = self.client.table(self.RECORDS_TABLE).select("*").in_("scrape_status", ["pending", "failed"])
 
         if source:
             query = query.eq("source", source)
@@ -183,7 +196,7 @@ class DatabaseManager:
             )
             return bool(resp.data)
         except Exception:
-            return False
+            raise RuntimeError("CMS tracking status update failed") from None
 
     def get_stats(self, source: str = None, collection: str = None) -> Dict[str, Any]:
         """Get statistics via Supabase RPC function."""
@@ -194,7 +207,7 @@ class DatabaseManager:
             ).execute()
             stats = resp.data if resp.data else {}
         except Exception:
-            stats = {}
+            raise RuntimeError("CMS state statistics unavailable") from None
 
         # Get breakdown if no filters applied
         breakdown = {}
@@ -203,7 +216,7 @@ class DatabaseManager:
                 resp2 = self.client.rpc("aidna_cms_get_breakdown").execute()
                 breakdown = resp2.data if resp2.data else {}
             except Exception:
-                pass
+                raise RuntimeError("CMS state breakdown unavailable") from None
 
         return {
             "total_records": stats.get("total_records", 0),
@@ -279,13 +292,15 @@ class DatabaseManager:
             }).execute()
             return True
         except Exception:
-            return False
+            raise RuntimeError("CMS checkpoint creation failed") from None
 
     def update_checkpoint(self, crawl_id: str, processed: int = None,
                           successful: int = None, failed: int = None,
-                          last_record: str = None, status: str = None):
+                          last_record: str = None, status: str = None, total: int = None):
         """Update an existing checkpoint."""
         update_data = {}
+        if total is not None:
+            update_data['total_items'] = total
         if processed is not None:
             update_data["processed_items"] = processed
         if successful is not None:

@@ -7,7 +7,13 @@ Contains all GraphQL queries and response key mappings.
 import time
 import requests
 from typing import Dict, List, Tuple, Optional, Any
-from tenacity import retry, stop_after_attempt, wait_exponential
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception
+
+
+def retryable_request(error):
+    if isinstance(error, (requests.Timeout, requests.ConnectionError)):
+        return True
+    return isinstance(error, requests.HTTPError) and error.response is not None and error.response.status_code in (408, 429, 500, 502, 503, 504)
 
 
 # =============================================================================
@@ -484,7 +490,7 @@ BUSINESSABC_QUERIES = {
             dean_name
             num_academic_staff
             num_students
-            locations
+            locations { data { id attributes { title } } }
             established
             afiliations
             address
@@ -1599,6 +1605,7 @@ class CMSFetcher:
         """
         self.graphql_url = graphql_url
         self.logger = logger
+        self.deadline = None
         self.session = requests.Session()
         self.session.headers.update({
             'Authorization': f'Bearer {bearer_token}',
@@ -1614,10 +1621,12 @@ class CMSFetcher:
     
     @retry(
         stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=1, max=10)
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        retry=retry_if_exception(retryable_request), reraise=True,
+        before_sleep=lambda state: state.args[0]._log('warning', f"Transient CMS failure; retry {state.attempt_number}/3 after backoff")
     )
     def fetch_page(self, query: str, response_key: str, page: int, 
-                   page_size: int = 25) -> Dict[str, Any]:
+                   page_size: int = 25, start: Optional[int] = None, ids=None) -> Dict[str, Any]:
         """
         Fetch a single page using the provided query.
         
@@ -1631,11 +1640,13 @@ class CMSFetcher:
             Dictionary with 'data' and 'meta' keys
         """
         variables = {
-            'pagination': {
+            'pagination': {'start': start, 'limit': page_size} if start is not None else {
                 'page': page,
                 'pageSize': page_size
             }
         }
+        if ids is not None:
+            variables['ids'] = ids
         
         payload = {
             'query': query,
@@ -1648,18 +1659,51 @@ class CMSFetcher:
                 json=payload,
                 timeout=30
             )
-            response.raise_for_status()
-            data = response.json()
+            try:
+                data = response.json()
+            except ValueError:
+                response.raise_for_status()
+                raise ValueError("CMS returned non-JSON data")
+
+            if not response.ok and response.status_code != 400:
+                response.raise_for_status()
             
             if 'errors' in data:
                 error_messages = [err.get('message', 'Unknown') for err in data['errors']]
-                raise Exception(f"GraphQL errors: {', '.join(error_messages)}")
+                raise ValueError(f"GraphQL errors: {', '.join(error_messages)}")
+
+            response.raise_for_status()
+            if not isinstance((data.get('data') or {}).get(response_key), dict):
+                raise ValueError(f"CMS response is missing collection {response_key}")
             
             return data['data'][response_key]
             
         except requests.exceptions.RequestException as e:
-            self._log('error', f"API request failed: {str(e)}")
+            self._log('error', f"CMS request failed ({type(e).__name__}); retry only transient failures")
             raise
+
+    def _fetch_window(self, query, response_key, start, size, page=None, ids=None):
+        """Recover an overloaded page without skipping any part of its original offset range."""
+        if self.deadline is not None and time.monotonic() >= self.deadline:
+            raise TimeoutError('CMS discovery time budget exhausted; extraction is incomplete')
+        try:
+            if page is not None:
+                return self.fetch_page(query, response_key, page, size, **({'ids': ids} if ids is not None else {}))
+            return self.fetch_page(query, response_key, 1, size, start=start, **({'ids': ids} if ids is not None else {}))
+        except (requests.HTTPError, requests.Timeout) as error:
+            transient = isinstance(error, requests.Timeout) or (
+                error.response is not None and error.response.status_code in (502, 503, 504))
+            if not transient or size <= 1:
+                raise
+            self._log('warning', f'CMS window at offset {start}, size {size} failed after retries; splitting without skipping records')
+            left_size = size // 2
+            left = self._fetch_window(query, response_key, start, left_size, ids=ids)
+            right = self._fetch_window(query, response_key, start + left_size, size - left_size, ids=ids)
+            rows = left['data'] + right['data']
+            if len({str(row['id']) for row in rows}) != len(rows):
+                raise ValueError('CMS offset recovery returned duplicate identities')
+            total = max(left['meta']['pagination']['total'], right['meta']['pagination']['total'])
+            return {'data': rows, 'meta': {'pagination': {'total': total, 'pageCount': (total + size - 1) // size}}}
     
     def fetch_all_pages(self, query: str, response_key: str, page_size: int = 25,
                        start_page: int = 1, max_records: Optional[int] = None,
@@ -1681,21 +1725,25 @@ class CMSFetcher:
         all_records = []
         current_page = start_page
         total_pages = None
-        consecutive_failures = 0
         stats = {
             'total_fetched': 0,
             'failed_pages': [],
             'start_page': start_page,
             'end_page': None,
             'total_pages': 0,
-            'total_available': 0
+            'total_available': 0,
+            'complete': False,
         }
         
         while True:
             try:
-                result = self.fetch_page(query, response_key, current_page, page_size)
+                if self.deadline is not None and time.monotonic() >= self.deadline:
+                    raise TimeoutError('CMS discovery time budget exhausted; extraction is incomplete')
+                result = self._fetch_window(query, response_key, (current_page - 1) * page_size, page_size, page=current_page)
                 records = result['data']
                 pagination = result['meta']['pagination']
+                if not isinstance(records, list) or any(not record.get('id') for record in records):
+                    raise ValueError("CMS returned invalid record identity")
                 
                 if total_pages is None:
                     total_pages = pagination['pageCount']
@@ -1715,7 +1763,6 @@ class CMSFetcher:
                     stats['total_fetched'] += len(records)
                 
                 stats['end_page'] = current_page
-                consecutive_failures = 0
                 
                 self._log('info', f"Page {current_page}/{total_pages}: Fetched {len(records)} records")
                 
@@ -1723,6 +1770,7 @@ class CMSFetcher:
                     break
                 
                 if current_page >= total_pages:
+                    stats['complete'] = not stats['failed_pages']
                     break
                 
                 current_page += 1
@@ -1731,16 +1779,37 @@ class CMSFetcher:
             except Exception as e:
                 self._log('error', f"Failed to fetch page {current_page}: {str(e)}")
                 stats['failed_pages'].append(current_page)
-                consecutive_failures += 1
-                current_page += 1
-                
-                if consecutive_failures >= 3:
-                    self._log('error', "Too many consecutive failures, stopping")
-                    break
-                
-                time.sleep(2)
+                stats['error'] = str(e)
+                # Never skip a failed page and call the collection complete.
+                break
         
         return all_records, stats
+
+    def fetch_inventory(self, cms_key, collection, page_size=100, delay=0.1):
+        keys = BUSINESSABC_RESPONSE_KEYS if cms_key == 'businessabc' else SPORTSABC_RESPONSE_KEYS
+        root = keys[collection]
+        query = '''query Inventory($pagination: PaginationArg) {
+          ROOT(pagination: $pagination, sort: ["id:asc"]) {
+            data { id attributes { updatedAt } }
+            meta { pagination { total page pageSize pageCount } }
+          }
+        }'''.replace('ROOT', root)
+        return self.fetch_all_pages(query, root, page_size=page_size, delay=delay)
+
+    def fetch_records(self, cms_key, collection, ids):
+        if not ids:
+            return []
+        queries = BUSINESSABC_QUERIES if cms_key == 'businessabc' else SPORTSABC_QUERIES
+        keys = BUSINESSABC_RESPONSE_KEYS if cms_key == 'businessabc' else SPORTSABC_RESPONSE_KEYS
+        root = keys[collection]
+        query = queries[collection].replace('$pagination: PaginationArg', '$pagination: PaginationArg, $ids: [ID!]!')
+        query = query.replace(f'{root}(pagination: $pagination)',
+            f'{root}(pagination: $pagination, filters: {{id: {{in: $ids}}}}, sort: ["id:asc"])')
+        result = self._fetch_window(query, root, 0, len(ids), page=1, ids=[str(id) for id in ids])
+        rows = result['data']
+        if len(rows) != len(ids) or {str(row['id']) for row in rows} != {str(id) for id in ids}:
+            raise ValueError('Selected CMS records were missing or duplicated; refusing incomplete delivery')
+        return rows
     
     def fetch_collection(self, cms_key: str, collection: str, 
                         page_size: int = 25, max_records: Optional[int] = None,
@@ -1770,6 +1839,8 @@ class CMSFetcher:
         
         query = queries[collection]
         response_key = response_keys[collection]
+        query = query.replace(f"{response_key}(pagination: $pagination)",
+                              f'{response_key}(pagination: $pagination, sort: ["id:asc"])')
         
         return self.fetch_all_pages(
             query, response_key,
