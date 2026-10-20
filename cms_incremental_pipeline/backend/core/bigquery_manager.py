@@ -4,6 +4,10 @@ Handles BigQuery table creation and record insertion.
 """
 
 import json
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+from pipeline_runtime import merge_records
 from typing import List, Dict, Tuple, Optional
 from datetime import datetime
 
@@ -62,7 +66,6 @@ class BigQueryManager:
             client = bigquery.Client(
                 credentials=credentials,
                 project=self.project_id,
-                location='EU'
             )
             self._log('info', f"BigQuery client initialized for project: {self.project_id}")
             return client
@@ -91,9 +94,7 @@ class BigQueryManager:
             self.client.get_table(self.table_id)
             self._log('info', f"Table exists: {self.table_id}")
         except Exception:
-            table = bigquery.Table(self.table_id, schema=schema)
-            self.client.create_table(table)
-            self._log('info', f"Created table: {self.table_id}")
+            raise RuntimeError("Configured BigQuery destination is unavailable; refusing automatic table creation") from None
     
     def insert_records(self, records: List[Dict]) -> Tuple[int, int, List[str]]:
         """
@@ -127,22 +128,15 @@ class BigQueryManager:
                 }
                 rows.append(row)
             except Exception as e:
-                self._log('error', f"Error preparing record {record.get('id')}: {e}")
+                raise ValueError(f"Invalid delivery record {record.get('id')}") from e
         
         if not rows:
             return 0, 0, []
         
         try:
-            errors = self.client.insert_rows_json(self.table_id, rows)
-            success_count = len(rows) - len(errors)
-            error_messages = [str(err) for err in errors[:5]]  # First 5 errors
-            
-            if errors:
-                self._log('warning', f"Insert completed with {len(errors)} errors")
-            else:
-                self._log('info', f"Inserted {success_count} records successfully")
-            
-            return success_count, len(errors), error_messages
+            success_count = merge_records(self.client, self.table_id, rows)
+            self._log('info', f"Confirmed {success_count} BigQuery records by readback")
+            return success_count, 0, []
             
         except Exception as e:
             self._log('error', f"Batch insert failed: {e}")

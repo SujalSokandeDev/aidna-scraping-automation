@@ -6,8 +6,15 @@ Contains all GraphQL queries and response key mappings.
 
 import time
 import requests
+import re
 from typing import Dict, List, Tuple, Optional, Any
-from tenacity import retry, stop_after_attempt, wait_exponential
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception
+
+
+def retryable_request(error):
+    if isinstance(error, (requests.Timeout, requests.ConnectionError)):
+        return True
+    return isinstance(error, requests.HTTPError) and error.response is not None and error.response.status_code in (408, 429, 500, 502, 503, 504)
 
 
 # =============================================================================
@@ -484,7 +491,7 @@ BUSINESSABC_QUERIES = {
             dean_name
             num_academic_staff
             num_students
-            locations
+            locations { data { id attributes { title } } }
             established
             afiliations
             address
@@ -1614,7 +1621,9 @@ class CMSFetcher:
     
     @retry(
         stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=1, max=10)
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        retry=retry_if_exception(retryable_request), reraise=True,
+        before_sleep=lambda state: state.args[0]._log('warning', f"Transient CMS failure; retry {state.attempt_number}/3 after backoff")
     )
     def fetch_page(self, query: str, response_key: str, page: int, 
                    page_size: int = 25) -> Dict[str, Any]:
@@ -1648,17 +1657,27 @@ class CMSFetcher:
                 json=payload,
                 timeout=30
             )
-            response.raise_for_status()
-            data = response.json()
+            try:
+                data = response.json()
+            except ValueError:
+                response.raise_for_status()
+                raise ValueError("CMS returned non-JSON data")
+
+            if not response.ok and response.status_code != 400:
+                response.raise_for_status()
             
             if 'errors' in data:
                 error_messages = [err.get('message', 'Unknown') for err in data['errors']]
-                raise Exception(f"GraphQL errors: {', '.join(error_messages)}")
+                raise ValueError(f"GraphQL errors: {', '.join(error_messages)}")
+
+            response.raise_for_status()
+            if not isinstance((data.get('data') or {}).get(response_key), dict):
+                raise ValueError(f"CMS response is missing collection {response_key}")
             
             return data['data'][response_key]
             
         except requests.exceptions.RequestException as e:
-            self._log('error', f"API request failed: {str(e)}")
+            self._log('error', f"CMS request failed ({type(e).__name__}); retry only transient failures")
             raise
     
     def fetch_all_pages(self, query: str, response_key: str, page_size: int = 25,
@@ -1688,7 +1707,8 @@ class CMSFetcher:
             'start_page': start_page,
             'end_page': None,
             'total_pages': 0,
-            'total_available': 0
+            'total_available': 0,
+            'complete': False,
         }
         
         while True:
@@ -1696,6 +1716,8 @@ class CMSFetcher:
                 result = self.fetch_page(query, response_key, current_page, page_size)
                 records = result['data']
                 pagination = result['meta']['pagination']
+                if not isinstance(records, list) or any(not record.get('id') for record in records):
+                    raise ValueError("CMS returned invalid record identity")
                 
                 if total_pages is None:
                     total_pages = pagination['pageCount']
@@ -1723,6 +1745,7 @@ class CMSFetcher:
                     break
                 
                 if current_page >= total_pages:
+                    stats['complete'] = not stats['failed_pages']
                     break
                 
                 current_page += 1
@@ -1731,14 +1754,9 @@ class CMSFetcher:
             except Exception as e:
                 self._log('error', f"Failed to fetch page {current_page}: {str(e)}")
                 stats['failed_pages'].append(current_page)
-                consecutive_failures += 1
-                current_page += 1
-                
-                if consecutive_failures >= 3:
-                    self._log('error', "Too many consecutive failures, stopping")
-                    break
-                
-                time.sleep(2)
+                stats['error'] = str(e)
+                # Never skip a failed page and call the collection complete.
+                break
         
         return all_records, stats
     
@@ -1770,6 +1788,8 @@ class CMSFetcher:
         
         query = queries[collection]
         response_key = response_keys[collection]
+        query = query.replace(f"{response_key}(pagination: $pagination)",
+                              f'{response_key}(pagination: $pagination, sort: ["id:asc"])')
         
         return self.fetch_all_pages(
             query, response_key,

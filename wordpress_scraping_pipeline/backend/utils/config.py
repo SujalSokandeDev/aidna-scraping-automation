@@ -14,12 +14,12 @@ from dotenv import load_dotenv
 WORDPRESS_SITES: Dict[str, Dict[str, str]] = {
     "FashionABC": {
         "url": "https://www.fashionabc.org/",
-        "sitemap": "https://www.fashionabc.org/sitemap_index.xml",
+        "sitemap": "https://www.fashionabc.org/sitemap.xml",
         "source_tag": "WordPress/FashionABC"
     },
     "FreedomX": {
         "url": "https://freedomx.com/",
-        "sitemap": "https://freedomx.com/sitemap_index.xml",
+        "sitemap": "https://freedomx.com/sitemap.xml",
         "source_tag": "WordPress/FreedomX"
     },
     "HedgeThink": {

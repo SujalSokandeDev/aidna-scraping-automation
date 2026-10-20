@@ -5,9 +5,12 @@ Handles data insertion into BigQuery's unified_all_cms_content table.
 
 import hashlib
 import json
+import sys
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional, Tuple
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+from pipeline_runtime import merge_records
 
 try:
     from google.cloud import bigquery
@@ -58,7 +61,8 @@ class BigQueryManager:
             self.client = bigquery.Client(project=project_id)
         
         # Ensure schema exists
-        self.ensure_table()
+        # A missing or forbidden destination is an operational error, not permission to redirect output.
+        self.client.get_table(self.table_id)
 
     def ensure_table(self):
         """Ensure the BigQuery table exists with correct schema."""
@@ -154,7 +158,7 @@ class BigQueryManager:
         }
         
         # Format external images
-        external_images = article.get('external_images', [])
+        external_images = article.get('external_images')
         
         # Parse dates
         published_at = self._parse_datetime(article.get('published_date'))
@@ -220,22 +224,10 @@ class BigQueryManager:
         if not records:
             return 0, 0, []
         
-        errors = self.client.insert_rows_json(
-            self.table_id,
-            records,
-            row_ids=[r['id'] for r in records]
-        )
-        
-        if not errors:
-            return len(records), 0, []
-        
-        # Process errors
-        error_messages = []
-        for error in errors:
-            error_messages.append(str(error))
-        
-        success_count = len(records) - len(errors)
-        return success_count, len(errors), error_messages
+        try:
+            return merge_records(self.client, self.table_id, records), 0, []
+        except Exception as error:
+            return 0, len(records), [str(error)]
     
     def insert_batch(self, articles: List[Dict[str, Any]], source: str,
                      batch_size: int = 20) -> Tuple[int, int, List[str]]:

@@ -2,197 +2,162 @@ name: AIDNA Nightly Scrape
 
 on:
   schedule:
-    # Run at midnight UTC daily (5:30 AM IST)
     - cron: '0 0 * * *'
   workflow_dispatch:
     inputs:
       mode:
-        description: 'Scraping mode'
+        description: 'Discovery mode (never resets tracking or deletes content)'
         required: true
-        default: 'incremental'
+        default: incremental
         type: choice
-        options:
-          - incremental
-          - full
+        options: [incremental, full]
       target:
-        description: 'Which pipeline to run'
+        description: 'Pipeline to run'
         required: true
-        default: 'both'
+        default: both
         type: choice
-        options:
-          - cms
-          - wp
-          - both
+        options: [cms, wp, both]
+      limit:
+        description: 'Maximum changed records per CMS collection / URLs per site'
+        required: true
+        default: '250'
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: aidna-scraping-production
+  cancel-in-progress: false
 
 env:
-  PYTHON_VERSION: '3.11'
+  PYTHONUNBUFFERED: '1'
+  MODE: ${{ inputs.mode || 'incremental' }}
+  RECORD_LIMIT: ${{ inputs.limit || '250' }}
+  GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+  EXPECTED_GCP_PROJECT_ID: ztudiumplatforms
+  BIGQUERY_DATASET: strapi_content_data
+  SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+  SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+  GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/service-account.json
+  GOOGLE_CREDENTIALS_PATH: ${{ github.workspace }}/service-account.json
 
 jobs:
-  # =========================================================================
-  # JOB 1: CMS Pipeline (BusinessABC + SportsABC via Strapi GraphQL)
-  # =========================================================================
   cms-pipeline:
-    name: CMS Pipeline (Strapi)
-    if: >-
-      github.event_name == 'schedule' ||
-      github.event.inputs.target == 'cms' ||
-      github.event.inputs.target == 'both'
+    name: CMS (${{ matrix.source }})
+    if: github.event_name == 'schedule' || inputs.target == 'cms' || inputs.target == 'both'
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        source: [businessabc, sportsabc]
     runs-on: ubuntu-latest
-    timeout-minutes: 120
-
+    timeout-minutes: 70
+    env:
+      BIGQUERY_TABLE: unified_cms_content_combined
+      BUSINESSABC_STRAPI_GRAPHQL_URL: ${{ secrets.BUSINESSABC_STRAPI_GRAPHQL_URL }}
+      BUSINESSABC_STRAPI_BEARER_TOKEN: ${{ secrets.BUSINESSABC_STRAPI_BEARER_TOKEN }}
+      SPORTSABC_STRAPI_GRAPHQL_URL: ${{ secrets.SPORTSABC_STRAPI_GRAPHQL_URL }}
+      SPORTSABC_STRAPI_BEARER_TOKEN: ${{ secrets.SPORTSABC_STRAPI_BEARER_TOKEN }}
+      LOG_FILE: ${{ github.workspace }}/cms_incremental_pipeline/logs/cms-${{ matrix.source }}.log
+      PIPELINE_REPORT_PATH: ${{ github.workspace }}/cms_incremental_pipeline/logs/report-${{ matrix.source }}.json
+      SOURCE: ${{ matrix.source }}
+      PAGE_SIZE: '100'
+      INSERT_BATCH_SIZE: '100'
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
-          python-version: ${{ env.PYTHON_VERSION }}
-
-      - name: Install CMS dependencies
-        run: pip install -r cms_incremental_pipeline/requirements.txt
-
-      - name: Write GCP service account key
-        run: |
-          mkdir -p cms_incremental_pipeline/data
-          echo '${{ secrets.GCP_SERVICE_ACCOUNT_JSON }}' > cms_incremental_pipeline/data/service-account.json
-
-      - name: Write CMS .env
-        run: |
-          cat > cms_incremental_pipeline/.env << 'ENVEOF'
-          BUSINESSABC_STRAPI_GRAPHQL_URL=${{ secrets.BUSINESSABC_STRAPI_GRAPHQL_URL }}
-          BUSINESSABC_STRAPI_BEARER_TOKEN=${{ secrets.BUSINESSABC_STRAPI_BEARER_TOKEN }}
-          SPORTSABC_STRAPI_GRAPHQL_URL=${{ secrets.SPORTSABC_STRAPI_GRAPHQL_URL }}
-          SPORTSABC_STRAPI_BEARER_TOKEN=${{ secrets.SPORTSABC_STRAPI_BEARER_TOKEN }}
-          GCP_PROJECT_ID=${{ secrets.GCP_PROJECT_ID }}
-          BIGQUERY_DATASET=strapi_content_data
-          BIGQUERY_TABLE=unified_cms_content_combined
-          GOOGLE_CREDENTIALS_PATH=../data/service-account.json
-          SUPABASE_URL=${{ secrets.SUPABASE_URL }}
-          SUPABASE_KEY=${{ secrets.SUPABASE_KEY }}
-          PAGE_SIZE=100
-          REQUEST_DELAY=0.1
-          INSERT_BATCH_SIZE=100
-          LOG_LEVEL=INFO
-          LOG_FILE=./logs/cms_pipeline.log
-          FLASK_PORT=5001
-          ENVEOF
-
-      - name: Run CMS diagnostics
-        working-directory: cms_incremental_pipeline/backend
-        run: python pipeline.py --diagnostics
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: cms_incremental_pipeline/requirements.txt
+      - run: pip install -r cms_incremental_pipeline/requirements.txt
+      - name: Prepare credentials
         env:
-          PYTHONUNBUFFERED: 1
-
-      - name: Run CMS incremental pipeline
+          GCP_SERVICE_ACCOUNT_JSON: ${{ secrets.GCP_SERVICE_ACCOUNT_JSON }}
+        run: python -c "import os,pathlib; p=pathlib.Path(os.environ['GOOGLE_APPLICATION_CREDENTIALS']); p.write_text(os.environ['GCP_SERVICE_ACCOUNT_JSON']); p.chmod(0o600)"
+      - name: Reconcile CMS records
         working-directory: cms_incremental_pipeline/backend
-        run: |
-          python pipeline.py \
-            --mode ${{ github.event.inputs.mode || 'incremental' }} \
-            --no-wikipedia
-        env:
-          PYTHONUNBUFFERED: 1
-
-      - name: Upload CMS logs
+        run: python pipeline.py --mode "$MODE" --source "$SOURCE" --limit "$RECORD_LIMIT" --no-wikipedia
+      - name: Publish result summary
         if: always()
-        uses: actions/upload-artifact@v4
+        run: python scripts/summarize_run.py "$PIPELINE_REPORT_PATH"
+      - uses: actions/upload-artifact@v4
+        if: always()
         with:
-          name: cms-pipeline-logs-${{ github.run_number }}
+          name: cms-${{ matrix.source }}-${{ github.run_number }}
           path: cms_incremental_pipeline/logs/
           retention-days: 14
-
-  # =========================================================================
-  # JOB 2: WordPress Pipeline (5 WordPress sites via sitemaps)
-  # =========================================================================
-  wp-pipeline:
-    name: WordPress Pipeline
-    if: >-
-      github.event_name == 'schedule' ||
-      github.event.inputs.target == 'wp' ||
-      github.event.inputs.target == 'both'
-    needs: [cms-pipeline]
-    runs-on: ubuntu-latest
-    timeout-minutes: 180
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-
-      - name: Install WordPress dependencies
-        run: pip install -r wordpress_scraping_pipeline/backend/requirements.txt
-
-      - name: Write GCP service account key
-        run: |
-          mkdir -p wordpress_scraping_pipeline/data
-          echo '${{ secrets.GCP_SERVICE_ACCOUNT_JSON }}' > wordpress_scraping_pipeline/data/service-account.json
-
-      - name: Write WordPress .env
-        run: |
-          cat > wordpress_scraping_pipeline/.env << 'ENVEOF'
-          GCP_PROJECT_ID=${{ secrets.GCP_PROJECT_ID }}
-          BIGQUERY_DATASET=strapi_content_data
-          BIGQUERY_TABLE=unified_all_cms_content
-          GOOGLE_APPLICATION_CREDENTIALS=../data/service-account.json
-          SUPABASE_URL=${{ secrets.SUPABASE_URL }}
-          SUPABASE_KEY=${{ secrets.SUPABASE_KEY }}
-          REQUEST_DELAY=1.5
-          MAX_RETRIES=3
-          WIKIMEDIA_MAX_IMAGES=2
-          INSERT_BATCH_SIZE=20
-          CHECKPOINT_INTERVAL=50
-          LOG_LEVEL=INFO
-          LOG_FILE=../logs/wordpress_pipeline.log
-          ENVEOF
-
-      - name: Run WordPress incremental pipeline
-        working-directory: wordpress_scraping_pipeline/backend
-        run: |
-          python pipeline.py \
-            --mode ${{ github.event.inputs.mode || 'incremental' }}
-        env:
-          PYTHONUNBUFFERED: 1
-
-      - name: Upload WordPress logs
+      - name: Remove runner credentials
         if: always()
-        uses: actions/upload-artifact@v4
+        run: python -c "import os,pathlib; pathlib.Path(os.environ['GOOGLE_APPLICATION_CREDENTIALS']).unlink(missing_ok=True)"
+
+  wp-pipeline:
+    name: Website (${{ matrix.site }})
+    if: github.event_name == 'schedule' || inputs.target == 'wp' || inputs.target == 'both'
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        site: [FashionABC, FreedomX, HedgeThink, IntelligentHQ, TradersDNA]
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    env:
+      BIGQUERY_TABLE: unified_all_cms_content
+      SITE: ${{ matrix.site }}
+      LOG_FILE: ${{ github.workspace }}/wordpress_scraping_pipeline/logs/wp-${{ matrix.site }}.log
+      PIPELINE_REPORT_PATH: ${{ github.workspace }}/wordpress_scraping_pipeline/logs/report-${{ matrix.site }}.json
+      PIPELINE_MAX_SECONDS: '2400'
+      WIKIMEDIA_MAX_IMAGES: '0'
+      REQUEST_TIMEOUT: '20'
+      MAX_RETRIES: '2'
+      INSERT_BATCH_SIZE: '20'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
-          name: wp-pipeline-logs-${{ github.run_number }}
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: wordpress_scraping_pipeline/backend/requirements.txt
+      - run: pip install -r wordpress_scraping_pipeline/backend/requirements.txt
+      - name: Prepare credentials
+        env:
+          GCP_SERVICE_ACCOUNT_JSON: ${{ secrets.GCP_SERVICE_ACCOUNT_JSON }}
+        run: python -c "import os,pathlib; p=pathlib.Path(os.environ['GOOGLE_APPLICATION_CREDENTIALS']); p.write_text(os.environ['GCP_SERVICE_ACCOUNT_JSON']); p.chmod(0o600)"
+      - name: Reconcile website records
+        working-directory: wordpress_scraping_pipeline/backend
+        run: python pipeline.py --mode "$MODE" --site "$SITE" --limit "$RECORD_LIMIT"
+      - name: Publish result summary
+        if: always()
+        run: python scripts/summarize_run.py "$PIPELINE_REPORT_PATH"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: wp-${{ matrix.site }}-${{ github.run_number }}
           path: wordpress_scraping_pipeline/logs/
           retention-days: 14
+      - name: Remove runner credentials
+        if: always()
+        run: python -c "import os,pathlib; pathlib.Path(os.environ['GOOGLE_APPLICATION_CREDENTIALS']).unlink(missing_ok=True)"
 
-  # =========================================================================
-  # JOB 3: Notification (runs after both complete)
-  # =========================================================================
   notify:
-    name: Pipeline Notification
+    name: Pipeline result
     needs: [cms-pipeline, wp-pipeline]
     if: always()
     runs-on: ubuntu-latest
-
+    env:
+      CMS_RESULT: ${{ needs.cms-pipeline.result }}
+      WP_RESULT: ${{ needs.wp-pipeline.result }}
+      TARGET: ${{ inputs.target || 'both' }}
     steps:
-      - name: Check results
+      - name: Check selected jobs
         run: |
-          echo "CMS Pipeline: ${{ needs.cms-pipeline.result }}"
-          echo "WP Pipeline:  ${{ needs.wp-pipeline.result }}"
-
-      - name: Report failure
-        if: >-
-          needs.cms-pipeline.result == 'failure' ||
-          needs.wp-pipeline.result == 'failure'
-        run: |
-          echo "::error::⚠️ One or more pipelines failed! Check logs above."
-          echo "CMS: ${{ needs.cms-pipeline.result }}"
-          echo "WP:  ${{ needs.wp-pipeline.result }}"
-          exit 1
-
-      - name: Report success
-        if: >-
-          needs.cms-pipeline.result == 'success' &&
-          needs.wp-pipeline.result == 'success'
-        run: |
-          echo "✅ Both pipelines completed successfully!"
+          python - <<'PY'
+          import os
+          results = {'cms': os.environ['CMS_RESULT'], 'wp': os.environ['WP_RESULT']}
+          selected = results if os.environ['TARGET'] == 'both' else {os.environ['TARGET']: results[os.environ['TARGET']]}
+          print(selected)
+          if any(result != 'success' for result in selected.values()):
+              raise SystemExit('At least one selected pipeline failed, was cancelled, or did not execute')
+          print('Selected bounded runs completed. Read per-source summaries for deferred backlog; this is not a claim that all historical content is current.')
+          PY
