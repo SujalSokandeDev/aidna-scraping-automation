@@ -407,6 +407,20 @@ class BigQueryDeliveryTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'State write/readback'):
             confirm_tracking(client, 'tracking', 'id', [{'id': '1', 'scrape_status': 'success', 'content_hash': 'h'}])
 
+    def test_stale_progress_timestamp_cannot_pass_state_readback(self):
+        client = Mock()
+        row = {'id': '1', 'scrape_status': 'success', 'content_hash': 'h', 'last_scraped': '2026-10-20T01:00:00Z'}
+        client.table.return_value.select.return_value.in_.return_value.execute.return_value.data = [{**row, 'last_scraped': '2026-10-19T01:00:00Z'}]
+        with self.assertRaisesRegex(RuntimeError, 'State write/readback'):
+            confirm_tracking(client, 'tracking', 'id', [row])
+
+    def test_readiness_probe_must_confirm_cleanup(self):
+        client = Mock()
+        client.table.return_value.select.return_value.eq.return_value.execute.side_effect = [
+            SimpleNamespace(data=[{'status': 'completed'}]), SimpleNamespace(data=[{'crawl_id': 'probe'}])]
+        with self.assertRaisesRegex(RuntimeError, 'cleanup was not confirmed'):
+            check_state_store(client, 'tracking', 'id', 'cms')
+
     def test_bulk_state_normalizes_keys_without_replacing_first_seen(self):
         client = Mock()
         rows = [{'id': 'old', 'scrape_status': 'success', 'content_hash': 'h', 'first_seen': '2020-01-01T00:00:00Z', 'sitemap_url': 'https://example.com/sitemap.xml'},

@@ -56,9 +56,11 @@ def confirm_tracking(client, table, key, rows):
         fields = set().union(*(row.keys() for row in batch))
         batch = [{field: row.get(field) for field in fields} for row in batch]
         client.table(table).upsert(batch, on_conflict=key).execute()
-        found = client.table(table).select(f"{key},scrape_status,content_hash").in_(key, [row[key] for row in batch]).execute().data
-        actual = {row[key]: (row.get("scrape_status"), row.get("content_hash")) for row in found or []}
-        if any(actual.get(row[key]) != (row.get("scrape_status"), row.get("content_hash")) for row in batch):
+        found = client.table(table).select(f"{key},scrape_status,content_hash,last_scraped,bigquery_id").in_(key, [row[key] for row in batch]).execute().data
+        def progress(row):
+            return row.get('scrape_status'), row.get('content_hash'), timestamp(row.get('last_scraped')), row.get('bigquery_id')
+        actual = {row[key]: progress(row) for row in found or []}
+        if any(actual.get(row[key]) != progress(row) for row in batch):
             raise RuntimeError("State write/readback failed; delivery will be retried safely")
 
 
@@ -74,6 +76,9 @@ def check_state_store(client, table, key, pipeline):
             raise RuntimeError("State readiness write/readback was not confirmed")
     finally:
         client.table("aidna_pipeline_checkpoints").delete().eq("crawl_id", crawl_id).execute()
+        remaining = client.table('aidna_pipeline_checkpoints').select('crawl_id').eq('crawl_id', crawl_id).execute().data
+        if remaining is None or remaining:
+            raise RuntimeError('Temporary readiness checkpoint cleanup was not confirmed')
 
 
 def merge_statement(table_id, source, columns):
