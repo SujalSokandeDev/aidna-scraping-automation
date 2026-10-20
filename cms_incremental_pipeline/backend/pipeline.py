@@ -520,6 +520,7 @@ class CMSPipeline:
                     stats['skipped'] += 1
             # Previously untracked records take precedence over legacy hash refreshes.
             pending.sort(key=lambda item: (bool(item[2]), item[2].get('last_scraped') or '', str(item[0]['id'])))
+            stats['eligible'] = len(pending)
             stats['deferred'] = max(0, len(pending) - self.max_records)
             pending = pending[:self.max_records]
             for offset in range(0, len(pending), self.config.insert_batch_size):
@@ -547,17 +548,24 @@ class CMSPipeline:
                 inserted, failed, errors = self.bq_manager.insert_records(prepared)
                 if failed or inserted != len(prepared):
                     stats['failed'] += len(prepared)
-                    raise RuntimeError('BigQuery delivery failed: ' + '; '.join(errors))
+                    message = 'BigQuery delivery failed: ' + '; '.join(errors)
+                    self.logger.error(f'{cms_key}/{collection}: {message}')
+                    for state in states:
+                        state.update(scrape_status='failed', error_message=message[:1000])
+                    self.db.confirm_records(states)
+                    stats.setdefault('delivery_errors', []).append(message)
+                    continue
                 stats['inserted'] += inserted
                 self.db.confirm_records(states)
                 self.delivery_manifest.extend({k: record[k] for k in ('id', 'source', 'content_type', 'processing_timestamp')} for record in prepared)
             if fetch_stats.get('failed_pages') or not fetch_stats.get('complete'):
                 raise RuntimeError('Incomplete extraction: ' + str(fetch_stats.get('error', 'pagination incomplete')))
-            stats['status'] = 'dry_run' if self.dry_run else 'completed'
+            stats['status'] = 'failed' if stats['failed'] else 'dry_run' if self.dry_run else 'completed'
         except Exception as error:
             self.logger.error(f"{cms_key}/{collection} failed: {error}")
             stats['status'] = 'failed'
             stats['error'] = str(error)
+        stats['deferred'] = max(0, stats.get('eligible', 0) - stats['processed'])
         self.logger.info(json.dumps(stats))
         return stats
     

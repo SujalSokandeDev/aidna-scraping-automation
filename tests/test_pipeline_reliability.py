@@ -66,7 +66,16 @@ class CMSReliabilityTests(unittest.TestCase):
         pipeline._bq_manager.insert_records.side_effect = None
         result = pipeline._process_collection(self.fetcher(), 'businessabc', 'post', 'BusinessABC/CitiesABC', 'incremental')
         self.assertEqual(result['status'], 'failed')
-        pipeline.db.confirm_records.assert_not_called()
+        self.assertTrue(all(row['scrape_status'] == 'failed' for row in pipeline.db.confirm_records.call_args.args[0]))
+
+    def test_failed_batch_does_not_block_later_delivery_or_claim_success(self):
+        pipeline = self.pipeline(); pipeline.max_records = 3
+        pipeline._bq_manager.insert_records.side_effect = [(0, 2, ['Denied']), (1, 0, [])]
+        result = pipeline._process_collection(self.fetcher([raw_record(str(i)) for i in range(3)]), 'businessabc', 'post', 'BusinessABC/CitiesABC', 'incremental')
+        self.assertEqual((result['failed'], result['inserted'], result['deferred']), (2, 1, 0))
+        calls = pipeline.db.confirm_records.call_args_list
+        self.assertTrue(all(row['scrape_status'] == 'failed' for row in calls[0].args[0]))
+        self.assertEqual(calls[1].args[0][0]['scrape_status'], 'success')
 
     def test_confirmed_upload_precedes_state_and_retains_history(self):
         pipeline = self.pipeline(); previous = {'record_id': 'businessabc_post_1', 'first_seen': '2020-01-01T00:00:00Z'}

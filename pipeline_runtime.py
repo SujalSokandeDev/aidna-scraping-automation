@@ -95,7 +95,7 @@ def merge_statement(table_id, source, columns):
 def merge_large_record(client, table_id, row, payload):
     """Load large JSON through a short-lived staging table, not a query parameter."""
     if len(payload.encode('utf-8')) > MAX_STAGED_RECORD_BYTES:
-        raise ValueError('Single source record exceeds the safe BigQuery row-size limit; no content was truncated')
+        raise ValueError(f'Source record {row["source"]}/{row["content_type"]}/{row["id"]} exceeds the safe BigQuery row-size limit; no content was truncated')
     from google.cloud import bigquery
     table = client.get_table(table_id)
     stage_id = table_id.rsplit('.', 1)[0] + '.aidna_stage_' + uuid.uuid4().hex
