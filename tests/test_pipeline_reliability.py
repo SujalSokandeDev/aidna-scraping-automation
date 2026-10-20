@@ -179,6 +179,16 @@ class CMSReliabilityTests(unittest.TestCase):
 
 
 class WebsiteReliabilityTests(unittest.TestCase):
+    def test_fetch_side_effect_timestamp_does_not_cause_perpetual_refresh(self):
+        pipeline = self.pipeline(1)
+        pipeline.crawler.crawl_site.return_value['urls'][0]['lastmod'] = '2026-10-20T01:00:00Z'
+        with patch.object(WP, 'utc_now', side_effect=['2026-10-20T02:00:00Z', '2026-10-20T02:00:02Z']):
+            self.assertEqual(self.run_site(pipeline)['uploaded'], 1)
+        saved = pipeline.db.confirm_urls.call_args.args[0][0]
+        self.assertEqual(saved['last_scraped'], '2026-10-20T02:00:02Z')
+        pipeline.db.tracking_records.return_value = {saved['url']: saved}
+        pipeline.crawler.crawl_site.return_value['urls'][0]['lastmod'] = '2026-10-20T02:00:01Z'
+        self.assertEqual(self.run_site(pipeline)['skipped'], 1)
     def test_scraper_identifies_only_explicit_attachment_markup(self):
         scraper = WP.ContentScraper(delay=0)
         scraper.fetch_page = Mock(return_value='<html><head><title>Image</title></head><body class="single attachment"><img src="photo.jpg"></body></html>')

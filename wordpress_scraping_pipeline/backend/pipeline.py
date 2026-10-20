@@ -130,6 +130,7 @@ class WordPressPipeline:
                              'last_scraped': utc_now(), 'scrape_count': (previous.get('scrape_count') or 0) + 1}
                     try:
                         article = self.scraper.scrape_url(url)
+                        state['last_scraped'] = utc_now()
                         if article.get('is_attachment'):
                             state.update(scrape_status='skipped', error_message=ATTACHMENT_REASON)
                             non_delivery_states.append(state)
@@ -150,7 +151,7 @@ class WordPressPipeline:
                                      bigquery_id=self.bq.generate_record_id(source, url))
                         articles.append(article); states.append(state)
                     except Exception as error:
-                        state.update(scrape_status='failed', error_message=str(error)[:1000])
+                        state.update(scrape_status='failed', error_message=str(error)[:1000], last_scraped=utc_now())
                         non_delivery_states.append(state); stats['failed'] += 1
                         self.logger.error(f'{site_name}: {url}: {error}')
                     stats['processed'] += 1
