@@ -198,6 +198,15 @@ class WebsiteReliabilityTests(unittest.TestCase):
 
 
 class SitemapTraversalTests(unittest.TestCase):
+    def test_navigation_sitemap_is_explicitly_skipped_not_parsed_as_content(self):
+        crawler = WP.SitemapCrawler(delay=0)
+        root, tags = 'https://example.com/sitemap.xml', 'https://example.com/post_tag-sitemap3.xml'
+        crawler.fetch_sitemap = Mock(return_value=self.index(tags))
+        result = crawler.crawl_site('Example', root)
+        self.assertTrue(result['complete'])
+        self.assertEqual(result['ignored_navigation_sitemaps'], [tags])
+        crawler.fetch_sitemap.assert_called_once_with(root)
+
     def index(self, *urls):
         return '<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">' + ''.join(f'<sitemap><loc>{url}</loc></sitemap>' for url in urls) + '</sitemapindex>'
 
@@ -280,6 +289,18 @@ class BigQueryDeliveryTests(unittest.TestCase):
         client = Mock(); client.table.return_value.select.return_value.in_.return_value.execute.return_value.data = []
         with self.assertRaisesRegex(RuntimeError, 'State write/readback'):
             confirm_tracking(client, 'tracking', 'id', [{'id': '1', 'scrape_status': 'success', 'content_hash': 'h'}])
+
+    def test_bulk_state_normalizes_keys_without_replacing_first_seen(self):
+        client = Mock()
+        rows = [{'id': 'old', 'scrape_status': 'success', 'content_hash': 'h', 'first_seen': '2020-01-01T00:00:00Z', 'sitemap_url': 'https://example.com/sitemap.xml'},
+                {'id': 'new', 'scrape_status': 'success', 'content_hash': 'h'}]
+        client.table.return_value.select.return_value.in_.return_value.execute.return_value.data = rows
+        confirm_tracking(client, 'tracking', 'id', rows)
+        batch = client.table.return_value.upsert.call_args.args[0]
+        self.assertEqual(set(batch[0]), set(batch[1]))
+        self.assertEqual(batch[0]['first_seen'], rows[0]['first_seen'])
+        self.assertTrue(batch[1]['first_seen'])
+        self.assertNotIn('first_seen', rows[1])
 
     def test_readiness_probe_cleanup_is_scoped_even_when_readback_fails(self):
         client = Mock()

@@ -245,7 +245,7 @@ class SitemapCrawler:
     def crawl_site(self, site_name: str, sitemap_url: str, 
                    filter_urls: bool = True) -> Dict[str, any]:
         """Traverse nested indexes without hiding failed children or following cycles."""
-        pending, visited, found, errors = [sitemap_url], set(), {}, []
+        pending, visited, found, errors, ignored = [sitemap_url], set(), {}, [], []
         host = (urlparse(sitemap_url).hostname or '').removeprefix('www.')
         while pending:
             url = pending.pop()
@@ -259,6 +259,10 @@ class SitemapCrawler:
                 parsed = urlparse(url)
                 if parsed.scheme not in ('http', 'https') or (parsed.hostname or '').removeprefix('www.') != host:
                     raise ValueError('Cross-site sitemap reference rejected')
+                # These children contain only navigation URLs already excluded by the content filter.
+                if filter_urls and re.search(r'/(category|post_tag|author)-sitemap\d*\.xml$', parsed.path):
+                    ignored.append(url)
+                    continue
                 xml = self.fetch_sitemap(url)
                 if not xml:
                     raise ValueError(f'Sitemap fetch failed: {url}')
@@ -275,12 +279,13 @@ class SitemapCrawler:
                 else:
                     raise ValueError('Response is not sitemap XML')
             except Exception as error:
-                errors.append(str(error))
+                errors.append(f'{url}: {error}')
             time.sleep(self.delay)
         urls = list(found.values())
         filtered = self.filter_content_urls(urls) if filter_urls else urls
         result = {'urls': filtered, 'total_found': len(urls), 'total_filtered': len(filtered),
-                  'skipped': len(urls) - len(filtered), 'errors': errors, 'complete': not errors}
+                  'skipped': len(urls) - len(filtered), 'errors': errors, 'complete': not errors,
+                  'ignored_navigation_sitemaps': ignored}
         if errors:
             result['error'] = '; '.join(errors[:5])
         return result

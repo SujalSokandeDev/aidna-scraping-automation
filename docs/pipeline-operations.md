@@ -23,6 +23,7 @@ CMS defaults are `https://cms.businessabc.net/graphql` and `https://cms.sportsab
 | TradersDNA | http://www.tradersdna.com/sitemap_index.xml |
 
 Nested sitemaps are traversed with cycle/duplicate protection. Child sitemap failures remain visible even if other children deliver content.
+Category, tag, and author navigation sitemaps are explicitly excluded and listed in reports, matching the existing exclusion of those navigation URLs. This also avoids treating IntelligentHQ's HTML response at `post_tag-sitemap3.xml` as an article-discovery failure; broken article sitemaps still fail visibly.
 
 ## Environment and credentials
 

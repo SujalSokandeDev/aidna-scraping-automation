@@ -94,6 +94,7 @@ class WordPressPipeline:
             discovery = self.crawler.crawl_site(site_name, site_info['sitemap'])
             stats['discovered'] = len(discovery['urls'])
             stats['discovery_errors'] = discovery.get('errors', [])
+            stats['ignored_navigation_sitemaps'] = discovery.get('ignored_navigation_sitemaps', [])
             tracking = self.db.tracking_records(source)
             candidates = []
             for item in discovery['urls']:
