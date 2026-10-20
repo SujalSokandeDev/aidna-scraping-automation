@@ -54,8 +54,11 @@ class CMSReliabilityTests(unittest.TestCase):
         return pipeline
 
     def fetcher(self, rows=None, complete=True):
-        return Mock(fetch_collection=Mock(return_value=(rows or [raw_record()],
+        rows = rows or [raw_record()]
+        fetcher = Mock(fetch_inventory=Mock(return_value=(rows,
                     {'complete': complete, 'failed_pages': [] if complete else [2], 'error': 'Page failed'})))
+        fetcher.fetch_records.side_effect = lambda cms, collection, ids: [row for row in rows if row['id'] in ids]
+        return fetcher
 
     def test_upload_failure_never_marks_records_successful(self):
         pipeline = self.pipeline()
@@ -81,10 +84,11 @@ class CMSReliabilityTests(unittest.TestCase):
     def test_unchanged_success_skips_but_modified_content_refreshes(self):
         pipeline = self.pipeline()
         pipeline.db.tracking_records.return_value = {'businessabc_post_1': {
-            'scrape_status': 'success', 'content_hash': content_hash(raw_record())}}
+            'scrape_status': 'success', 'content_hash': content_hash(raw_record()), 'last_scraped': '2026-10-20T02:00:00Z'}}
         skipped = pipeline._process_collection(self.fetcher(), 'businessabc', 'post', 'BusinessABC/CitiesABC', 'incremental')
         self.assertEqual(skipped['skipped'], 1); pipeline.db.confirm_records.assert_not_called()
-        changed = pipeline._process_collection(self.fetcher([raw_record(title='Updated')]), 'businessabc', 'post', 'BusinessABC/CitiesABC', 'incremental')
+        updated = raw_record(title='Updated'); updated['attributes']['updatedAt'] = '2026-10-20T03:00:00Z'
+        changed = pipeline._process_collection(self.fetcher([updated]), 'businessabc', 'post', 'BusinessABC/CitiesABC', 'incremental')
         self.assertEqual(changed['inserted'], 1)
 
     def test_incomplete_extraction_is_not_reported_complete(self):
@@ -92,8 +96,17 @@ class CMSReliabilityTests(unittest.TestCase):
         self.assertEqual(result['status'], 'failed'); self.assertEqual(result['failed_pages'], [2])
 
     def test_limits_leave_remaining_records_eligible(self):
-        result = self.pipeline()._process_collection(self.fetcher([raw_record(str(i)) for i in range(5)]), 'businessabc', 'post', 'BusinessABC/CitiesABC', 'incremental')
+        fetcher = self.fetcher([raw_record(str(i)) for i in range(5)])
+        result = self.pipeline()._process_collection(fetcher, 'businessabc', 'post', 'BusinessABC/CitiesABC', 'incremental')
         self.assertEqual(result['inserted'], 2); self.assertEqual(result['deferred'], 3)
+        self.assertEqual(fetcher.fetch_records.call_args.args[2], ['0', '1'])
+        fetcher.fetch_collection.assert_not_called()
+
+    def test_selected_record_download_requires_all_requested_ids(self):
+        fetcher = CMS.CMSFetcher('https://example.invalid/graphql', '')
+        fetcher._fetch_window = Mock(return_value={'data': [raw_record('1')]})
+        with self.assertRaisesRegex(ValueError, 'missing or duplicated'):
+            fetcher.fetch_records('businessabc', 'post', ['1', '2'])
 
     def test_dry_run_never_writes_tracking_or_uploads(self):
         pipeline = self.pipeline(); pipeline.dry_run = True
@@ -124,6 +137,28 @@ class CMSReliabilityTests(unittest.TestCase):
         self.assertFalse(stats['complete']); self.assertEqual(stats['failed_pages'], [1])
         fetcher.fetch_page.assert_not_called()
 
+    def test_overloaded_page_recovers_exact_offsets_without_skipping(self):
+        fetcher = CMS.CMSFetcher('https://example.invalid/graphql', '')
+        response = requests.Response(); response.status_code = 503
+        unavailable = requests.HTTPError('Overloaded', response=response)
+        def result(id):
+            return {'data': [raw_record(id)], 'meta': {'pagination': {'total': 4, 'pageCount': 4}}}
+        fetcher.fetch_page = Mock(side_effect=[unavailable, result('3'), result('4')])
+        rows, stats = fetcher.fetch_all_pages('query', 'posts', page_size=2, start_page=2, delay=0)
+        self.assertEqual([row['id'] for row in rows], ['3', '4'])
+        self.assertTrue(stats['complete']); self.assertFalse(stats['failed_pages'])
+        calls = fetcher.fetch_page.call_args_list
+        self.assertEqual(calls[1].kwargs['start'], 2); self.assertEqual(calls[2].kwargs['start'], 3)
+
+    def test_failed_recovery_slice_cannot_be_reported_as_complete(self):
+        fetcher = CMS.CMSFetcher('https://example.invalid/graphql', '')
+        response = requests.Response(); response.status_code = 503
+        unavailable = requests.HTTPError('Overloaded', response=response)
+        fetcher.fetch_page = Mock(side_effect=[unavailable, {'data': [raw_record()], 'meta': {'pagination': {'total': 2}}}, unavailable])
+        rows, stats = fetcher.fetch_all_pages('query', 'posts', page_size=2, delay=0)
+        self.assertFalse(stats['complete']); self.assertEqual(stats['failed_pages'], [1])
+        self.assertFalse(rows)
+
     def test_permanent_400_is_not_retried_and_explains_schema_error(self):
         fetcher = CMS.CMSFetcher('https://example.invalid/graphql', '')
         response = requests.Response(); response.status_code = 400
@@ -135,6 +170,32 @@ class CMSReliabilityTests(unittest.TestCase):
 
 
 class WebsiteReliabilityTests(unittest.TestCase):
+    def test_scraper_identifies_only_explicit_attachment_markup(self):
+        scraper = WP.ContentScraper(delay=0)
+        scraper.fetch_page = Mock(return_value='<html><head><title>Image</title></head><body class="single attachment"><img src="photo.jpg"></body></html>')
+        self.assertTrue(scraper.scrape_url('https://example.com/photo/')['is_attachment'])
+        scraper.fetch_page.return_value = '<html><head><title>Article</title></head><body class="single post"><article>Text</article></body></html>'
+        self.assertFalse(scraper.scrape_url('https://example.com/article/')['is_attachment'])
+    def test_explicit_media_attachment_is_reported_skipped_not_uploaded(self):
+        pipeline = self.pipeline(1)
+        pipeline.scraper.scrape_url.side_effect = lambda url: {'url': url, 'is_attachment': True}
+        result = self.run_site(pipeline)
+        self.assertEqual(result['status'], 'completed'); self.assertEqual(result['excluded_media'], 1)
+        self.assertEqual(result['failed'], 0); pipeline.bq.insert_batch.assert_not_called()
+        state = pipeline.db.confirm_urls.call_args.args[0][0]
+        self.assertEqual(state['scrape_status'], 'skipped')
+        pipeline.db.tracking_records.return_value = {state['url']: state}
+        pipeline.scraper.scrape_url.reset_mock()
+        self.assertEqual(self.run_site(pipeline)['processed'], 0)
+        pipeline.scraper.scrape_url.assert_not_called()
+
+    def test_empty_article_without_attachment_marker_remains_failure(self):
+        pipeline = self.pipeline(1)
+        pipeline.scraper.scrape_url.side_effect = lambda url: {'url': url, 'title': 'Article', 'raw_html': ''}
+        result = self.run_site(pipeline)
+        self.assertEqual(result['status'], 'failed'); self.assertEqual(result['failed'], 1)
+        pipeline.bq.insert_batch.assert_not_called()
+
     def pipeline(self, rows=3):
         pipeline = WP.WordPressPipeline.__new__(WP.WordPressPipeline)
         pipeline.config = SimpleNamespace(insert_batch_size=2, request_delay=0, wikimedia_max_images=0)
@@ -294,12 +355,34 @@ class BigQueryDeliveryTests(unittest.TestCase):
         self.assertEqual(merge_records(client, 'project.dataset.table', [first, second]), 2)
         self.assertEqual(client.query.call_count, 4)
 
-    def test_oversized_single_record_is_not_marked_delivered(self):
+    def test_large_single_record_uses_and_cleans_owned_expiring_staging_table(self):
         row = self.row(); row['attributes'] = {'content': 'x' * 3_100_000}
         client = self.client()
-        with self.assertRaisesRegex(ValueError, 'single record'):
+        client.get_table.return_value.schema = []
+        client.load_table_from_json.return_value.output_rows = 1
+        self.assertEqual(merge_records(client, 'project.dataset.table', [row]), 1)
+        stage = client.create_table.call_args.args[0]
+        self.assertTrue(stage.table_id.startswith('aidna_stage_'))
+        self.assertIsNotNone(stage.expires)
+        client.delete_table.assert_called_once_with(str(stage.reference), not_found_ok=True)
+
+    def test_failed_large_load_cleans_only_its_stage_and_never_merges(self):
+        row = self.row(); row['attributes'] = {'content': 'x' * 3_100_000}
+        client = self.client(); client.get_table.return_value.schema = []
+        client.load_table_from_json.side_effect = RuntimeError('Load denied')
+        with self.assertRaisesRegex(RuntimeError, 'Load denied'):
             merge_records(client, 'project.dataset.table', [row])
-        client.query.assert_not_called()
+        client.query.assert_not_called(); client.delete_table.assert_called_once()
+        self.assertIn('.aidna_stage_', client.delete_table.call_args.args[0])
+
+    def test_unsupported_record_size_is_not_truncated_or_delivered(self):
+        row = self.row(); row['attributes'] = {'content': 'x' * 2000}
+        client = self.client()
+        from pipeline_runtime import merge_large_record
+        with patch('pipeline_runtime.MAX_STAGED_RECORD_BYTES', 1000):
+            with self.assertRaisesRegex(ValueError, 'no content was truncated'):
+                merge_large_record(client, 'project.dataset.table', row, json.dumps([row]))
+        client.create_table.assert_not_called()
 
     def test_uncertain_accepted_job_is_retrieved_before_readback(self):
         client = self.client(); client.query.side_effect = [Conflict('exists'), Mock(result=Mock(return_value=[SimpleNamespace(id='1', source='3', content_type='post')]))]

@@ -263,7 +263,7 @@ class SitemapCrawler:
                 if parsed.scheme not in ('http', 'https') or (parsed.hostname or '').removeprefix('www.') != host:
                     raise ValueError('Cross-site sitemap reference rejected')
                 # These children contain only navigation URLs already excluded by the content filter.
-                if filter_urls and re.search(r'/(category|post_tag|author)-sitemap\d*\.xml$', parsed.path):
+                if filter_urls and re.search(r'/(category|post_tag|author|attachment)-sitemap\d*\.xml$', parsed.path):
                     ignored.append(url)
                     continue
                 xml = self.fetch_sitemap(url)
@@ -278,7 +278,7 @@ class SitemapCrawler:
                         item_url = urlparse(item['url'])
                         if item_url.scheme not in ('http', 'https') or (item_url.hostname or '').removeprefix('www.') != host:
                             raise ValueError('Cross-site content URL rejected')
-                        found[item['url']] = item
+                        found[item['url']] = {**item, 'sitemap_url': url}
                 else:
                     raise ValueError('Response is not sitemap XML')
             except Exception as error:

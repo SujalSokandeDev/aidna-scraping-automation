@@ -5,7 +5,9 @@ import json
 import os
 import re
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+
+MAX_STAGED_RECORD_BYTES = 90_000_000
 
 
 def content_hash(value):
@@ -74,6 +76,55 @@ def check_state_store(client, table, key, pipeline):
         client.table("aidna_pipeline_checkpoints").delete().eq("crawl_id", crawl_id).execute()
 
 
+def merge_statement(table_id, source, columns):
+    identity = " AND ".join(f"T.{column}=S.{column}" for column in ("id", "source", "content_type"))
+    assignments = ", ".join(
+        "external_images=CASE WHEN S.external_images IS NULL OR JSON_TYPE(S.external_images)='null' THEN T.external_images ELSE S.external_images END"
+        if column == 'external_images' else f"{column}=S.{column}"
+        for column in columns if column not in ("id", "source", "content_type"))
+    return (f"""MERGE `{table_id}` T USING ({source}) S ON {identity}
+      WHEN MATCHED THEN UPDATE SET {assignments}
+      WHEN NOT MATCHED THEN INSERT ({', '.join(columns)}) VALUES ({', '.join('S.' + column for column in columns)})""", identity)
+
+
+def merge_large_record(client, table_id, row, payload):
+    """Load large JSON through a short-lived staging table, not a query parameter."""
+    if len(payload.encode('utf-8')) > MAX_STAGED_RECORD_BYTES:
+        raise ValueError('Single source record exceeds the safe BigQuery row-size limit; no content was truncated')
+    from google.cloud import bigquery
+    table = client.get_table(table_id)
+    stage_id = table_id.rsplit('.', 1)[0] + '.aidna_stage_' + uuid.uuid4().hex
+    stage = bigquery.Table(stage_id, schema=table.schema)
+    stage.expires = datetime.now(timezone.utc) + timedelta(hours=1)
+    stage.labels = {'application': 'aidna-scraping', 'purpose': 'temporary-delivery'}
+    client.create_table(stage)
+    try:
+        load = client.load_table_from_json([row], stage_id, location=table.location,
+            job_config=bigquery.LoadJobConfig(schema=table.schema,
+                create_disposition='CREATE_NEVER', write_disposition='WRITE_EMPTY'))
+        load.result(timeout=180)
+        if load.output_rows != 1:
+            raise RuntimeError('Large-record staging load was not confirmed')
+        source = f'SELECT * FROM `{stage_id}`'
+        query, identity = merge_statement(table_id, source, list(row))
+        config = bigquery.QueryJobConfig(maximum_bytes_billed=int(os.getenv('BIGQUERY_MAX_BYTES_BILLED', '10737418240')),
+            labels={'application': 'aidna-scraping'})
+        job = client.query(query, location=table.location, job_config=config)
+        job.result(timeout=180)
+        verification = f'''SELECT S.id,S.source,S.content_type FROM `{stage_id}` S
+          WHERE EXISTS(SELECT 1 FROM `{table_id}` T WHERE {identity}
+          AND T.processing_timestamp=S.processing_timestamp)'''
+        actual = {(r.id, r.source, r.content_type) for r in client.query(
+            verification, location=table.location, job_config=config).result(timeout=180)}
+        if actual != {(row['id'], row['source'], row['content_type'])}:
+            raise RuntimeError('Large-record BigQuery readback failed; tracking remains retryable')
+        print(f'Confirmed staged BigQuery delivery: {row["source"]}/{row["content_type"]}/{row["id"]}')
+        return 1
+    finally:
+        # Only this invocation's generated, expiring staging table is ever removed.
+        client.delete_table(stage_id, not_found_ok=True)
+
+
 def merge_records(client, table_id, records):
     """Atomically upsert a batch. Return only after BigQuery confirms the job and readback.
 
@@ -106,9 +157,10 @@ def merge_records(client, table_id, records):
         rows.append(row)
     payload = json.dumps(rows, ensure_ascii=False)
     # Leave room for JSON request escaping, query text and client metadata under API limits.
-    if len(payload.encode("utf-8")) > 3_000_000:
+    parameter_limit = min(3_000_000, max(100, int(os.getenv('BIGQUERY_PARAMETER_LIMIT_BYTES', '3000000'))))
+    if len(payload.encode("utf-8")) > parameter_limit:
         if len(rows) == 1:
-            raise ValueError("A single record exceeds the safe 3 MB delivery payload limit")
+            return merge_large_record(client, table_id, rows[0], payload)
         middle = len(rows) // 2
         return merge_records(client, table_id, rows[:middle]) + merge_records(client, table_id, rows[middle:])
 
@@ -120,14 +172,7 @@ def merge_records(client, table_id, records):
             expression = f"TIMESTAMP({expression})"
         selections.append(f"{expression} AS {column}")
     source = "SELECT " + ", ".join(selections) + " FROM UNNEST(JSON_QUERY_ARRAY(PARSE_JSON(@payload))) item"
-    identity = " AND ".join(f"T.{column}=S.{column}" for column in ("id", "source", "content_type"))
-    assignments = ", ".join(
-        "external_images=CASE WHEN S.external_images IS NULL OR JSON_TYPE(S.external_images)='null' THEN T.external_images ELSE S.external_images END"
-        if column == 'external_images' else f"{column}=S.{column}"
-        for column in columns if column not in ("id", "source", "content_type"))
-    query = f"""MERGE `{table_id}` T USING ({source}) S ON {identity}
-      WHEN MATCHED THEN UPDATE SET {assignments}
-      WHEN NOT MATCHED THEN INSERT ({', '.join(columns)}) VALUES ({', '.join('S.' + column for column in columns)})"""
+    query, identity = merge_statement(table_id, source, columns)
     config = bigquery.QueryJobConfig(
         query_parameters=[bigquery.ScalarQueryParameter("payload", "STRING", payload)],
         maximum_bytes_billed=int(os.getenv("BIGQUERY_MAX_BYTES_BILLED", "10737418240")),

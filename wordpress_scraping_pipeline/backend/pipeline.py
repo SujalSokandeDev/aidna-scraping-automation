@@ -22,6 +22,7 @@ from core.content_cleaner import ContentCleaner
 from core.wikimedia_augmenter import WikimediaAugmenter
 from core.bigquery_manager import BigQueryManager, DryRunBigQueryManager
 
+ATTACHMENT_REASON = 'Media attachment page; not an article'
 
 class WordPressPipeline:
     def __init__(self, config=None, dry_run=False):
@@ -85,7 +86,7 @@ class WordPressPipeline:
     def _scrape_site(self, site_name, site_info, mode='incremental'):
         source = site_info['source_tag']
         stats = dict(site=site_name, source=source, discovered=0, eligible=0, processed=0,
-                     uploaded=0, failed=0, skipped=0, deferred=0, status='running')
+                     uploaded=0, failed=0, skipped=0, excluded_media=0, deferred=0, status='running')
         crawl_id = f'{site_name}_{uuid.uuid4().hex}'
         checkpoint_created = False
         deadline = time.monotonic() + self.max_seconds
@@ -101,6 +102,10 @@ class WordPressPipeline:
                 previous = tracking.get(item['url'], {})
                 changed = bool(item.get('lastmod') and previous.get('last_scraped')
                                and timestamp(item['lastmod']) > timestamp(previous['last_scraped']))
+                if (mode != 'full' and previous.get('scrape_status') == 'skipped'
+                        and previous.get('error_message') == ATTACHMENT_REASON and not changed):
+                    stats['skipped'] += 1
+                    continue
                 if previous.get('scrape_status') != 'success' or not previous.get('content_hash') or changed:
                     candidates.append((item, previous))
                 else:
@@ -115,15 +120,23 @@ class WordPressPipeline:
                 if self.stop_requested or time.monotonic() >= deadline - upload_reserve:
                     break
                 batch = candidates[offset:offset + self.config.insert_batch_size]
-                articles, states, failed_states = [], [], []
+                articles, states, non_delivery_states = [], [], []
                 for item, previous in batch:
                     if self.stop_requested or time.monotonic() >= deadline - upload_reserve:
                         break
                     url = item['url']
                     state = {**previous, 'url': url, 'source': source, 'last_modified': item.get('lastmod'),
+                             'sitemap_url': item.get('sitemap_url') or previous.get('sitemap_url'),
                              'last_scraped': utc_now(), 'scrape_count': (previous.get('scrape_count') or 0) + 1}
                     try:
                         article = self.scraper.scrape_url(url)
+                        if article.get('is_attachment'):
+                            state.update(scrape_status='skipped', error_message=ATTACHMENT_REASON)
+                            non_delivery_states.append(state)
+                            stats['excluded_media'] += 1
+                            stats['skipped'] += 1
+                            stats['processed'] += 1
+                            continue
                         article['content'] = self.cleaner.clean_html(article['raw_html'])
                         if not article.get('title') or not article['content'].strip():
                             raise ValueError('No usable title/content; refusing to index an empty page')
@@ -138,7 +151,7 @@ class WordPressPipeline:
                         articles.append(article); states.append(state)
                     except Exception as error:
                         state.update(scrape_status='failed', error_message=str(error)[:1000])
-                        failed_states.append(state); stats['failed'] += 1
+                        non_delivery_states.append(state); stats['failed'] += 1
                         self.logger.error(f'{site_name}: {url}: {error}')
                     stats['processed'] += 1
                     time.sleep(self.config.request_delay)
@@ -152,8 +165,8 @@ class WordPressPipeline:
                         self.db.confirm_urls(states)
                         self.delivery_manifest.extend({'id': self.bq.generate_record_id(source, article['url']),
                             'source': source, 'content_type': 'post', 'url': article['url']} for article in articles)
-                    if failed_states:
-                        self.db.confirm_urls(failed_states)
+                    if non_delivery_states:
+                        self.db.confirm_urls(non_delivery_states)
                     self.db.update_checkpoint(crawl_id, processed=stats['processed'], successful=stats['uploaded'], failed=stats['failed'])
                 if self.progress_callback:
                     self.progress_callback(stats['processed'], len(candidates), site_name)

@@ -25,7 +25,7 @@ from typing import Dict, List, Optional, Tuple
 # Add parent to path
 sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from pipeline_runtime import content_hash, utc_now
+from pipeline_runtime import content_hash, utc_now, timestamp
 
 from utils.config import Config, CMS_SOURCES
 from utils.logger import setup_logging, get_logger
@@ -500,9 +500,9 @@ class CMSPipeline:
                            mode: str) -> Dict:
         """Reconcile changed content in bounded batches; commit state after confirmed delivery."""
         stats = dict(collection=collection, source=source_tag, fetched=0, processed=0,
-                     inserted=0, failed=0, skipped=0, deferred=0, status='started')
+                     downloaded=0, inserted=0, failed=0, skipped=0, deferred=0, status='started')
         try:
-            records, fetch_stats = fetcher.fetch_collection(
+            records, fetch_stats = fetcher.fetch_inventory(
                 cms_key, collection, page_size=self.config.page_size, delay=self.config.request_delay)
             stats['fetched'] = len(records)
             stats['failed_pages'] = fetch_stats.get('failed_pages', [])
@@ -510,22 +510,29 @@ class CMSPipeline:
             pending = []
             for record in records:
                 key = f"{cms_key}_{collection}_{record['id']}"
-                digest = content_hash(record)
                 previous = tracking.get(key, {})
-                if previous.get('scrape_status') != 'success' or previous.get('content_hash') != digest:
-                    pending.append((record, key, digest, previous))
+                modified = timestamp((record.get('attributes') or {}).get('updatedAt'))
+                scraped = timestamp(previous.get('last_scraped'))
+                if (mode == 'full' or previous.get('scrape_status') != 'success' or not previous.get('content_hash')
+                        or not modified or not scraped or modified > scraped):
+                    pending.append((record, key, previous))
                 else:
                     stats['skipped'] += 1
             # Previously untracked records take precedence over legacy hash refreshes.
-            pending.sort(key=lambda item: (bool(item[3]), str(item[0]['id'])))
+            pending.sort(key=lambda item: (bool(item[2]), item[2].get('last_scraped') or '', str(item[0]['id'])))
             stats['deferred'] = max(0, len(pending) - self.max_records)
             pending = pending[:self.max_records]
             for offset in range(0, len(pending), self.config.insert_batch_size):
                 if self.stop_requested:
                     raise RuntimeError('Interrupted; remaining records will resume next run')
                 batch = pending[offset:offset + self.config.insert_batch_size]
+                downloaded = fetcher.fetch_records(cms_key, collection, [row[0]['id'] for row in batch])
+                full_records = {str(row['id']): row for row in downloaded}
+                stats['downloaded'] += len(downloaded)
                 prepared, states = [], []
-                for raw, key, digest, previous in batch:
+                for inventory, key, previous in batch:
+                    raw = full_records[str(inventory['id'])]
+                    digest = content_hash(raw)
                     record = self.processor.structure_record(raw, collection, source_tag, cms_key)
                     # Preserve optional historical image enrichment on existing rows during refresh.
                     record['external_images'] = None

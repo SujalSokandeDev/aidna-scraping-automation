@@ -22,6 +22,11 @@ on:
         required: true
         default: '250'
         type: string
+      verify_staging:
+        description: 'Exercise expiring staging-table delivery using genuine records'
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -37,6 +42,7 @@ env:
   GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
   EXPECTED_GCP_PROJECT_ID: ztudiumplatforms
   BIGQUERY_DATASET: strapi_content_data
+  BIGQUERY_PARAMETER_LIMIT_BYTES: ${{ inputs.verify_staging && '100' || '3000000' }}
   SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
   SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
   GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/service-account.json
@@ -63,7 +69,7 @@ jobs:
       PIPELINE_REPORT_PATH: ${{ github.workspace }}/cms_incremental_pipeline/logs/report-${{ matrix.source }}.json
       SOURCE: ${{ matrix.source }}
       PAGE_SIZE: '100'
-      INSERT_BATCH_SIZE: '100'
+      INSERT_BATCH_SIZE: '10'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
