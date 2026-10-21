@@ -44,12 +44,22 @@ Discovery is also time-bounded through `PIPELINE_MAX_SECONDS` (CMS default 3,300
 
 Both modes rediscover sources non-destructively. CMS first inventories IDs and `updatedAt`, then downloads only the bounded changed/failed/untracked selection. Full mode also rotates through existing records by oldest scrape time. The complete downloaded source record is hashed for tracking; incremental refresh depends on the CMS updating `updatedAt`. Transiently overloaded full-record pages can split into exact offset windows without skipping records. Websites retry failed/untracked records and refresh successful ones when sitemap lastmod is newer. Legacy successful records without a hash are refreshed once. A site with no lastmod cannot advertise later edits reliably; periodic explicit revalidation is a separate operational decision.
 
-WordPress pages explicitly marked as media attachments are recorded as skipped with a reason and are not uploaded as articles. Empty article pages without that marker still fail. Existing BigQuery content is not deleted by this exclusion.
+WordPress pages explicitly marked as media attachments are recorded as skipped with a reason and are not uploaded as articles. Isolated empty/unsupported pages, missing pages (404/410), and exhausted network errors are skipped with warnings. Existing BigQuery content is not deleted by these exclusions.
 Website scrape timestamps are captured after fetching the page, so source timestamp changes during that request do not automatically look newer than the saved scrape snapshot.
 
 Optional Wikipedia/Wikimedia enrichment remains in the code, but is disabled in the scheduled workflow to prioritize reliable content delivery and avoid slow, unrelated enrichment calls. Existing images are preserved on update.
 
-Review every job summary and its `report-*.json` artifact. Reports include discovered/fetched, processed, confirmed, failed, deferred counts and a delivery manifest. `backlog` means a bounded run succeeded but there is still work outstanding; it does not mean all historical content is up to date. Dispatch another bounded run to continue. A failed page, invalid content, unconfirmed BigQuery delivery, or state-write failure must be investigated, not marked as complete.
+Review every job summary and its `report-*.json` artifact. Reports include discovered/fetched, processed, confirmed, failed, deferred counts and a delivery manifest. `backlog` means a bounded run succeeded but there is still work outstanding; it does not mean all historical content is up to date. Dispatch another bounded run to continue. Unconfirmed BigQuery delivery or state-write failure must be investigated, not marked as complete.
+
+## Page-level warnings (21 October 2026)
+
+Website jobs continue processing good articles when an isolated page returns 404/410, has no usable title/body, or exhausts HTTP/network retries. HTTP 429 and 500/502/503/504 use the existing bounded retry adapter, exponential backoff and Retry-After support. Missing pages are not retried within the request. These skips do not upload empty records or mark them delivered. They preserve existing content and remain eligible for subsequent nightly attempts, including recovery after source fixes. Only unchanged, explicitly marked media attachments retain the existing persistent exclusion.
+
+Reports use `completed_with_warnings` and retain the deferred backlog count. Summaries show confirmed deliveries, total skipped, page-warning count and every warning URL/reason. Page warnings are a subset of skipped; unchanged records and excluded attachments also contribute to skipped. A green GitHub job with warnings is not a claim of complete source coverage.
+
+To avoid hiding a broken site/parser, the job still fails if all attempted non-attachment pages are rejected, or at least five pages and 20% of attempted non-attachment pages are rejected. The threshold is evaluated on this run's processed sample, not the entire discovered inventory. Small samples with one warning and one successful page complete with warnings; a single attempted page that fails still fails the site. Valid deliveries are retained even when this safeguard fails the job.
+
+Authentication/access denials (401/403), unexpected scraper errors, sitemap/discovery failures, interruptions, BigQuery delivery failures and tracking/checkpoint failures remain fatal. CMS behavior, database schemas, existing data and source mappings are unchanged.
 
 No changes here rebrand historical article text or purge search results. Those findings remain separate in `docs/investigations/2026-10-20-search-data-cleanup-and-pipeline-findings.md`.
 

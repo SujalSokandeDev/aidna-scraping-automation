@@ -4,7 +4,10 @@ import logging
 import os
 import sys
 import tempfile
+import subprocess
+import threading
 import unittest
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -208,12 +211,160 @@ class WebsiteReliabilityTests(unittest.TestCase):
         self.assertEqual(self.run_site(pipeline)['processed'], 0)
         pipeline.scraper.scrape_url.assert_not_called()
 
-    def test_empty_article_without_attachment_marker_remains_failure(self):
+    def test_all_attempted_articles_empty_remains_site_failure(self):
         pipeline = self.pipeline(1)
         pipeline.scraper.scrape_url.side_effect = lambda url: {'url': url, 'title': 'Article', 'raw_html': ''}
         result = self.run_site(pipeline)
-        self.assertEqual(result['status'], 'failed'); self.assertEqual(result['failed'], 1)
+        self.assertEqual(result['status'], 'failed'); self.assertEqual(result['warning_count'], 1)
+        self.assertIn('Widespread', result['error'])
         pipeline.bq.insert_batch.assert_not_called()
+
+    def test_isolated_page_errors_warn_and_preserve_valid_delivery(self):
+        for kind in ('empty', '404', '410', '429', '503', 'timeout', 'connection'):
+            with self.subTest(kind=kind):
+                pipeline = self.pipeline(2)
+                valid = pipeline.scraper.scrape_url.side_effect
+                def scrape(url):
+                    if url.endswith('0'):
+                        if kind == 'empty':
+                            return {'title': 'Empty', 'raw_html': ''}
+                        if kind == 'timeout':
+                            raise requests.Timeout('Timed out after retries')
+                        if kind == 'connection':
+                            raise requests.ConnectionError('Connection failed after retries')
+                        response = requests.Response(); response.status_code = int(kind)
+                        raise requests.HTTPError(f'HTTP {kind}', response=response)
+                    return valid(url)
+                pipeline.scraper.scrape_url.side_effect = scrape
+                result = self.run_site(pipeline)
+                self.assertEqual(result['status'], 'completed_with_warnings')
+                self.assertEqual(result['uploaded'], 1)
+                self.assertEqual(result['warning_count'], 1)
+                self.assertEqual(result['skipped'], 1)
+                self.assertEqual(result['failed'], 0)
+                self.assertIn('article-0', result['warnings'][0]['url'])
+                states = [state for call in pipeline.db.confirm_urls.call_args_list for state in call.args[0]]
+                self.assertEqual([state['scrape_status'] for state in states], ['success', 'skipped'])
+
+    def test_warned_page_is_retried_and_can_recover(self):
+        pipeline = self.pipeline(2); saved = {}
+        pipeline.db.tracking_records.side_effect = lambda source: saved.copy()
+        pipeline.db.confirm_urls.side_effect = lambda rows: saved.update((row['url'], row) for row in rows)
+        valid = pipeline.scraper.scrape_url.side_effect
+        pipeline.scraper.scrape_url.side_effect = lambda url: {'title': 'Empty', 'raw_html': ''} if url.endswith('0') else valid(url)
+        self.assertEqual(self.run_site(pipeline)['warning_count'], 1)
+        pipeline.scraper.scrape_url.side_effect = valid
+        result = self.run_site(pipeline)
+        self.assertEqual(result['uploaded'], 1)
+        self.assertEqual(result['status'], 'completed')
+        self.assertTrue(all(state['scrape_status'] == 'success' for state in saved.values()))
+
+    def test_access_denial_and_unexpected_errors_remain_failures(self):
+        for error in (requests.HTTPError('Denied', response=SimpleNamespace(status_code=401)),
+                      requests.HTTPError('Denied', response=SimpleNamespace(status_code=403)),
+                      RuntimeError('Unexpected scraper bug')):
+            with self.subTest(error=str(error)):
+                pipeline = self.pipeline(2)
+                pipeline.scraper.scrape_url.side_effect = error
+                self.assertEqual(self.run_site(pipeline)['status'], 'failed')
+
+    def test_state_store_failure_with_page_warnings_still_fails(self):
+        pipeline = self.pipeline(2)
+        pipeline.scraper.scrape_url.side_effect = requests.Timeout('Timeout')
+        pipeline.db.confirm_urls.side_effect = RuntimeError('State write/readback failed')
+        self.assertEqual(self.run_site(pipeline)['status'], 'failed')
+
+    def test_widespread_failure_threshold(self):
+        for processed, warnings, attachments, expected in (
+                (0, 0, 0, False), (1, 1, 0, True), (2, 1, 0, False),
+                (25, 4, 0, False), (25, 5, 0, True), (26, 5, 0, False),
+                (127, 9, 0, False), (250, 1, 0, False), (3, 1, 2, True)):
+            with self.subTest(processed=processed, warnings=warnings):
+                self.assertEqual(WP.excessive_page_failures(processed, warnings, attachments), expected)
+
+    def test_many_rejected_pages_still_deliver_good_records_but_fail_site(self):
+        pipeline = self.pipeline(25); pipeline.max_records = 25
+        valid = pipeline.scraper.scrape_url.side_effect
+        pipeline.scraper.scrape_url.side_effect = lambda url: {'title': 'Empty', 'raw_html': ''} if int(url.rsplit('-', 1)[1]) < 5 else valid(url)
+        result = self.run_site(pipeline)
+        self.assertEqual(result['uploaded'], 20)
+        self.assertEqual(result['warning_count'], 5)
+        self.assertEqual(result['status'], 'failed')
+        self.assertIn('Widespread', result['error'])
+
+    def test_warning_run_report_keeps_backlog_visible(self):
+        pipeline = self.pipeline()
+        pipeline.db.check_ready = Mock()
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / 'report.json'
+            pipeline.config.base_dir = Path(temp)
+            pipeline._scrape_site = Mock(return_value={'status': 'completed_with_warnings', 'warning_count': 1, 'deferred': 10})
+            with patch.dict(os.environ, {'PIPELINE_REPORT_PATH': str(path)}):
+                report = pipeline._run('incremental', 'FashionABC')
+            self.assertEqual(report['status'], 'completed_with_warnings')
+            self.assertEqual(json.loads(path.read_text())['sites'][0]['deferred'], 10)
+
+    def test_retry_adapter_retries_transient_status_but_not_missing_pages(self):
+        scraper = WP.ContentScraper(max_retries=2)
+        retry = scraper.session.get_adapter('https://').max_retries
+        self.assertTrue(retry.is_retry('GET', 429))
+        self.assertTrue(retry.is_retry('GET', 503))
+        self.assertFalse(retry.is_retry('GET', 404))
+        self.assertFalse(retry.is_retry('GET', 410))
+        self.assertEqual(retry.total, 2)
+        self.assertTrue(retry.respect_retry_after_header)
+
+    def test_empty_http_response_is_an_expected_page_rejection(self):
+        scraper = WP.ContentScraper(delay=0)
+        scraper.fetch_page = Mock(return_value='')
+        with self.assertRaisesRegex(WP.UnusablePage, 'Empty response body'):
+            scraper.scrape_url('https://example.com/empty')
+
+    def test_real_http_retries_recover_or_preserve_failure_type(self):
+        statuses = []
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(statuses.pop(0))
+                self.end_headers()
+                self.wfile.write(b'<html><title>Recovered</title></html>')
+            def log_message(self, *args):
+                pass
+        server = HTTPServer(('127.0.0.1', 0), Handler)
+        worker = threading.Thread(target=server.serve_forever, daemon=True); worker.start()
+        scraper = WP.ContentScraper(max_retries=2, timeout=2)
+        url = f'http://127.0.0.1:{server.server_port}/article'
+        try:
+            with patch('urllib3.util.retry.time.sleep'):
+                for codes in ([429, 200], [503, 200]):
+                    statuses[:] = codes
+                    self.assertIn('Recovered', scraper.fetch_page(url))
+                    self.assertEqual(statuses, [])
+                statuses[:] = [503, 503, 503]
+                with self.assertRaises(requests.exceptions.RetryError):
+                    scraper.fetch_page(url)
+                self.assertEqual(statuses, [])
+                for code in (404, 410, 403):
+                    statuses[:] = [code]
+                    with self.assertRaises(requests.HTTPError) as caught:
+                        scraper.fetch_page(url)
+                    self.assertEqual(caught.exception.response.status_code, code)
+        finally:
+            scraper.session.close()
+            server.shutdown(); server.server_close(); worker.join(timeout=5)
+
+    def test_summary_includes_warning_urls_counts_and_backlog(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path, summary = Path(temp) / 'report.json', Path(temp) / 'summary.md'
+            path.write_text(json.dumps({'status': 'completed_with_warnings', 'sites': [{
+                'site': 'Example', 'status': 'completed_with_warnings', 'uploaded': 1,
+                'skipped': 1, 'warning_count': 1, 'deferred': 8,
+                'warnings': [{'url': 'https://example.com/missing', 'reason': 'HTTP 404'}]}]}))
+            result = subprocess.run([sys.executable, str(ROOT / 'scripts/summarize_run.py'), str(path)],
+                env={**os.environ, 'GITHUB_STEP_SUMMARY': str(summary)}, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('completed_with_warnings', result.stdout)
+            self.assertIn('https://example.com/missing: HTTP 404', summary.read_text())
+            self.assertIn('| 1 | 1 | 1 | 0 | 8 |', result.stdout)
 
     def pipeline(self, rows=3):
         pipeline = WP.WordPressPipeline.__new__(WP.WordPressPipeline)
