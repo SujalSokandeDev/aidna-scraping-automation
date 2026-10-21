@@ -8,6 +8,7 @@ import signal
 import sys
 import time
 import uuid
+import requests
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -23,6 +24,15 @@ from core.wikimedia_augmenter import WikimediaAugmenter
 from core.bigquery_manager import BigQueryManager, DryRunBigQueryManager
 
 ATTACHMENT_REASON = 'Media attachment page; not an article'
+
+
+class UnusablePage(ValueError):
+    """A fetched page cannot safely be indexed as an article."""
+
+
+def excessive_page_failures(processed, warnings, excluded_media=0):
+    attempts = processed - excluded_media
+    return bool(warnings and (warnings == attempts or (warnings >= 5 and warnings / attempts >= 0.2)))
 
 class WordPressPipeline:
     def __init__(self, config=None, dry_run=False):
@@ -76,7 +86,8 @@ class WordPressPipeline:
         report = {'started_by': os.getenv('GITHUB_RUN_ID', 'local'), 'finished_at': utc_now(),
                   'dry_run': self.dry_run, 'sites': results, 'delivery_manifest': self.delivery_manifest}
         report['status'] = ('failed' if self.stop_requested or any(row['status'] == 'failed' for row in results)
-                            else 'dry_run' if self.dry_run else 'backlog' if any(row['deferred'] for row in results) else 'completed')
+                            else 'dry_run' if self.dry_run else 'completed_with_warnings' if any(row['warning_count'] for row in results)
+                            else 'backlog' if any(row['deferred'] for row in results) else 'completed')
         path = Path(os.getenv('PIPELINE_REPORT_PATH', self.config.base_dir / 'logs' / 'wp-report.json'))
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(report, indent=2), encoding='utf-8')
@@ -86,7 +97,8 @@ class WordPressPipeline:
     def _scrape_site(self, site_name, site_info, mode='incremental'):
         source = site_info['source_tag']
         stats = dict(site=site_name, source=source, discovered=0, eligible=0, processed=0,
-                     uploaded=0, failed=0, skipped=0, excluded_media=0, deferred=0, status='running')
+                     uploaded=0, failed=0, skipped=0, excluded_media=0, deferred=0, status='running',
+                     warning_count=0, warnings=[])
         crawl_id = f'{site_name}_{uuid.uuid4().hex}'
         checkpoint_created = False
         deadline = time.monotonic() + self.max_seconds
@@ -140,7 +152,7 @@ class WordPressPipeline:
                             continue
                         article['content'] = self.cleaner.clean_html(article['raw_html'])
                         if not article.get('title') or not article['content'].strip():
-                            raise ValueError('No usable title/content; refusing to index an empty page')
+                            raise UnusablePage('No usable title/content; refusing to index an empty page')
                         article['word_count'] = self.cleaner.get_word_count(article['content'])
                         article['reading_time'] = self.cleaner.get_reading_time(article['content'])
                         article['title'] = self.cleaner.clean_title(article['title'])
@@ -150,6 +162,17 @@ class WordPressPipeline:
                         state.update(scrape_status='success', content_hash=article['content_hash'], error_message=None,
                                      bigquery_id=self.bq.generate_record_id(source, url))
                         articles.append(article); states.append(state)
+                    except (UnusablePage, requests.RequestException) as error:
+                        status_code = getattr(getattr(error, 'response', None), 'status_code', None)
+                        # Authentication/access failures require operator attention, not a silent skip.
+                        if status_code in (401, 403):
+                            raise
+                        state.update(scrape_status='skipped', error_message=str(error)[:1000], last_scraped=utc_now())
+                        non_delivery_states.append(state)
+                        stats['warning_count'] += 1
+                        stats['skipped'] += 1
+                        stats['warnings'].append({'url': url, 'reason': str(error)[:1000], 'http_status': status_code})
+                        self.logger.warning(f'{site_name}: skipped {url}: {error}')
                     except Exception as error:
                         state.update(scrape_status='failed', error_message=str(error)[:1000], last_scraped=utc_now())
                         non_delivery_states.append(state); stats['failed'] += 1
@@ -172,7 +195,10 @@ class WordPressPipeline:
                 if self.progress_callback:
                     self.progress_callback(stats['processed'], len(candidates), site_name)
             stats['deferred'] = max(0, stats['eligible'] - stats['processed'])
-            stats['status'] = 'failed' if stats['failed'] or discovery.get('error') or self.stop_requested else 'dry_run' if self.dry_run else 'completed'
+            if excessive_page_failures(stats['processed'], stats['warning_count'], stats['excluded_media']):
+                stats['error'] = 'Widespread page failures: all attempted articles, or at least 5 and 20%, were rejected'
+            stats['status'] = ('failed' if stats['failed'] or stats.get('error') or discovery.get('error') or discovery.get('errors') or self.stop_requested
+                               else 'dry_run' if self.dry_run else 'completed_with_warnings' if stats['warning_count'] else 'completed')
         except Exception as error:
             stats.update(status='failed', error=str(error))
             self.logger.error(f'{site_name} failed: {error}')

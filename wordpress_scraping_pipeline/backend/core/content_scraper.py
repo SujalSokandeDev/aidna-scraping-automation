@@ -76,7 +76,8 @@ class ContentScraper:
             read=self.max_retries,
             connect=self.max_retries,
             backoff_factor=1,
-            status_forcelist=[500, 502, 503, 504]
+            status_forcelist=[429, 500, 502, 503, 504],
+            respect_retry_after_header=True
         )
         
         adapter = HTTPAdapter(max_retries=retry)
@@ -101,12 +102,10 @@ class ContentScraper:
         Returns:
             HTML content as string, or None if failed
         """
-        try:
-            response = self.session.get(url, timeout=self.timeout)
-            response.raise_for_status()
-            return response.text
-        except Exception as e:
-            raise Exception(f"Failed to fetch page: {e}")
+        # Preserve HTTP status and exception type for page-level handling.
+        response = self.session.get(url, timeout=self.timeout)
+        response.raise_for_status()
+        return response.text
     
     def extract_metadata(self, soup: BeautifulSoup, url: str) -> Dict[str, Any]:
         """
