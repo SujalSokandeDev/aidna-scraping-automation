@@ -314,6 +314,12 @@ class WebsiteReliabilityTests(unittest.TestCase):
         self.assertEqual(retry.total, 2)
         self.assertTrue(retry.respect_retry_after_header)
 
+    def test_empty_http_response_is_an_expected_page_rejection(self):
+        scraper = WP.ContentScraper(delay=0)
+        scraper.fetch_page = Mock(return_value='')
+        with self.assertRaisesRegex(WP.UnusablePage, 'Empty response body'):
+            scraper.scrape_url('https://example.com/empty')
+
     def test_real_http_retries_recover_or_preserve_failure_type(self):
         statuses = []
         class Handler(BaseHTTPRequestHandler):

@@ -18,16 +18,12 @@ from utils.config import Config, WORDPRESS_SITES
 from utils.logger import setup_logging
 from core.database_manager import DatabaseManager
 from core.sitemap_crawler import SitemapCrawler
-from core.content_scraper import ContentScraper
+from core.content_scraper import ContentScraper, UnusablePage
 from core.content_cleaner import ContentCleaner
 from core.wikimedia_augmenter import WikimediaAugmenter
 from core.bigquery_manager import BigQueryManager, DryRunBigQueryManager
 
 ATTACHMENT_REASON = 'Media attachment page; not an article'
-
-
-class UnusablePage(ValueError):
-    """A fetched page cannot safely be indexed as an article."""
 
 
 def excessive_page_failures(processed, warnings, excluded_media=0):

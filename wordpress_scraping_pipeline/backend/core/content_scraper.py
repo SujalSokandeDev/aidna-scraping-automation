@@ -16,6 +16,10 @@ from urllib3.util.retry import Retry
 from bs4 import BeautifulSoup
 
 
+class UnusablePage(ValueError):
+    """A fetched page cannot safely be indexed as an article."""
+
+
 class ContentScraper:
     """Scrapes and extracts content from WordPress article pages."""
     
@@ -379,7 +383,7 @@ class ContentScraper:
         # Fetch page
         html = self.fetch_page(url)
         if not html:
-            raise Exception("Failed to fetch page")
+            raise UnusablePage('Empty response body; refusing to index an empty page')
         
         soup = BeautifulSoup(html, 'lxml')
         
